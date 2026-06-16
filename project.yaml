@@ -1,0 +1,11 @@
+name: kite
+version: 1.0.0
+description: A declarative intent-based C/C++ build system with first-class support for Zuri extensions.
+homepage: "https://github.com/zuri-lang/kite"
+tags: []
+author: Richard Ore <eqliqandfriends@gmail.com>
+license: MIT
+sources:
+  - "https://pub.zurilang.org"
+deps: {}
+cvs_deps: {}

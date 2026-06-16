@@ -1,0 +1,243 @@
+# kite.yaml — project root manifest
+
+name: myproject
+version: 1.0.0
+description: "A fast networking library"
+license: MIT
+authors:
+  - "Richard Ore <richard@example.com>"
+
+# Minimum toolchain versions
+requires:
+  kite: ">=1.0.0"
+  zuri: ">=0.9.0" # optional; only for Zuri C extension targets
+
+# ── Workspace (monorepo) ──────────────────────────────────────────────────
+# kite resolves build order via link_targets dependency graph automatically
+workspace:
+  members:
+    - libs/core
+    - libs/net
+    - apps/cli
+    - tests
+
+# ── Global defaults (inherited and overridable by every target) ───────────
+defaults:
+  std:
+    c: c11
+    cxx: c++17
+  compiler:
+    "*": cc
+    linux: gcc
+    macos: clang
+    windows: cl
+  linker:
+    "*": lld
+    linux: ld
+    macos: ld
+    windows: link
+  output_dir: dist
+
+# ── Build profiles ────────────────────────────────────────────────────────
+# Invoked with: kite build --profile release
+# Profiles compose with (not replace) base target config
+profiles:
+  debug:
+    defines:
+      "*": [DEBUG=1, ASSERTIONS=1]
+    compile_options:
+      unix: [-O0, -g3, -fno-omit-frame-pointer]
+      windows: [/Od, /Zi]
+
+  release:
+    defines:
+      "*": [NDEBUG=1]
+    compile_options:
+      unix: [-O3, -flto, -fvisibility=hidden]
+      windows: [/O2, /GL]
+    link_options:
+      unix: [-flto, -s]
+      windows: [/LTCG]
+
+  asan:
+    inherits: debug
+    compile_options:
+      unix: [-fsanitize=address, undefined, -fno-sanitize-recover=all]
+    link_options:
+      unix: [-fsanitize=address, undefined]
+
+  coverage:
+    inherits: debug
+    compile_options:
+      unix: [--coverage]
+    link_options:
+      unix: [--coverage]
+
+# ── Targets ───────────────────────────────────────────────────────────────
+targets:
+  # ── Shared library ───────────────────────────────────────────────────
+  coroutine:
+    type:
+      shared_library # executable | shared_library | static_library
+      # object_library | header_only | zuri_module
+    output_name:
+      "*": coroutine
+      windows: coroutine_win
+
+    std:
+      c: c11 # overrides default for this target only
+
+    sources:
+      "*":
+        - src/**/*.c # glob supported; ** is recursive
+      x86_64:
+        - src/arch/x86_64.c
+      arm64:
+        - src/arch/arm64.c
+      exclude: # exclude always wins over include
+        - src/experimental/**
+        - src/deprecated.c
+
+    includes:
+      public: # propagated to anything that link_targets this
+        "*": [include]
+      private: # only used when compiling this target
+        "*": [src/internal]
+
+    defines:
+      "*": [CORO_VERSION="1.0.0", BUILDING_CORO=1]
+      debug: [CORO_DEBUG=1]
+      release: [CORO_PRODUCTION=1]
+
+    compile_options:
+      "linux && x86_64": [-O2, -Wall, -Wextra, -msse4.2]
+      "linux && arm64": [-O2, -Wall, -Wextra, -march=armv8-a+crypto]
+      macos: [-O2, -Wall, -Wextra]
+      windows: [/W3, /D_CRT_SECURE_NO_WARNINGS]
+      clang: [-Weverything, -Wno-padded]
+
+    link_options:
+      linux: [-lm, -lpthread]
+      macos: []
+      windows: []
+
+    # Named sibling targets this target depends on and links against.
+    # kite handles build ordering and public include propagation automatically.
+    link_targets: []
+
+    # System libraries resolved via pkg-config with fallbacks
+    system_libs:
+      - pkg_config: "openssl >= 1.1"
+        fallback:
+          includes:
+            windows: [C:/OpenSSL/include]
+          link_options:
+            windows: [libssl.lib, libcrypto.lib]
+            linux: [-lssl, -lcrypto]
+
+    # Per-file overrides — for vendored code, generated files, etc.
+    file_options:
+      src/vendor/stb_image.c:
+        compile_options:
+          "*": [-w, -O1]
+      src/generated/parser.c:
+        compile_options:
+          "*": [-w]
+
+    # Pre-build code generation steps, run in order before compilation
+    generators:
+      - tool: flex
+        inputs: [src/lexer.l]
+        outputs: [src/gen/lexer.c, src/gen/lexer.h]
+      - tool: scripts/gen_opcodes.zu
+        inputs: [opcodes.yaml]
+        outputs: [src/gen/opcodes.c, include/opcodes.h]
+
+    # System package prerequisites — tells kite (and users) what to install
+    # before building. kite can run `kite deps` to install these.
+    package_dependencies:
+      "apt | yum": [libssl-dev, flex]
+      brew: [openssl, flex]
+      pacman: [openssl, flex]
+      winget: [OpenSSL.OpenSSL]
+
+    # What gets published/installed when `kite install` is run
+    install:
+      headers: include/ # directory tree, preserves structure
+      files:
+        - src: coroutine.zu
+          dest: share/zuri/modules/
+
+  # ── Static variant — same sources, different link semantics ──────────
+  coroutine_static:
+    type: static_library
+    inherits: coroutine # copies all fields, then applies overrides
+    output_name:
+      "*": coroutine_static
+
+  # ── Executable ───────────────────────────────────────────────────────
+  demo:
+    type: executable
+    sources:
+      "*": [examples/demo.c]
+    link_targets: [coroutine] # links sibling; inherits public includes
+    link_options:
+      windows: [/SUBSYSTEM:CONSOLE]
+
+    depends_on: [coroutine] # ensures coroutine is built before demo
+
+  # ── Test target ───────────────────────────────────────────────────────
+  # Built and run by `kite test`
+  tests:
+    type: test
+    sources:
+      "*": [tests/**/*.c]
+    link_targets: [coroutine]
+    runner: zuri # executable to invoke; default is the binary itself
+    runner_args: [--verbose]
+    timeout: 30 # seconds per test binary
+
+# ── Build hooks ───────────────────────────────────────────────────────────
+# Runs at project level, not per-target
+hooks:
+  pre_build: [scripts/gen_version.sh]
+  post_build: [scripts/sign.sh]
+
+  # They can use shell scripts too
+  pre_test: |
+    echo 'Something before tests...'
+    echo 'Another thing before tests...'
+
+  # And can even be platform-specific
+  post_install:
+    windows: |
+      echo 'Verifying on Windows...'
+      cmd /c scripts/verify.sh
+    linux: |
+      echo 'Verifying on Linux...'
+      bash scripts/verify.sh
+
+  # Pre-fetch dependencies by downloading them to the build cache
+  pre_fetch:
+    "*":
+      - url: https://github.com/madler/zlib.git
+        type: git
+        target: ./vendor/zlib
+    windows:
+      - url: https://download.example.com/openssl-1.1.1k-Win64-x64.zip
+        type: zip
+        target: ./vendor/openssl
+    "linux && arm64":
+      - url: https://download.example.com/openssl-1.1.1k-linux-arm64.tar.gz
+        type: tar.gz
+        target: ./vendor/openssl
+
+# ── Environment expectations ──────────────────────────────────────────────
+# kite validates these exist before starting any build
+env:
+  ZURI_ROOT:
+    required: true
+    description: "Path to Zuri installation"
+  OPENSSL_ROOT:
+    required: false
+    default: /usr/local

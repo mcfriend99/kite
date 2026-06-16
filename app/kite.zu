@@ -1,0 +1,350 @@
+/**
+ * kite.zu  —  The kite build system CLI entry point.
+ *
+ * Usage
+ * ─────
+ *   zuri kite.zu [command] [options]
+ *
+ * Commands
+ * ────────
+ *   build   [--profile <name>] [--target <name>] [--verbose] [--dry-run]
+ *   test    [--profile <name>] [--verbose]
+ *   clean   [--full]
+ *   install [--prefix <path>] [--profile <name>]
+ *   deps    [--dry-run]
+ *   targets                    # list all declared targets
+ *   help
+ *
+ * Options
+ * ───────
+ *   --config  <path>    Path to build.yaml  (default: ./build.yaml)
+ *   --profile <name>    Build profile       (default: debug)
+ *   --target  <name>    Build only this target (may be repeated)
+ *   --prefix  <path>    Install prefix      (default: /usr/local)
+ *   --verbose           Show every compiler/linker command
+ *   --dry-run           Print commands without executing them
+ *   --jobs    <n>       Parallel compile jobs (default: 1; reserved for future)
+ *   --full              With `clean`: also remove the build cache
+ *
+ * Configuration file
+ * ──────────────────
+ *   kite reads build.yaml (or the path given with --config) from the
+ *   current working directory.  The YAML is parsed with the `yaml` module
+ *   and fed into intent.Project.from_raw().
+ *
+ * Example build.yaml
+ * ──────────────────
+ *   name: mylib
+ *   version: 1.0.0
+ *
+ *   targets:
+ *     mylib:
+ *       type: shared_library
+ *       sources:
+ *         "*": [src/ **\/ *.c]
+ *       includes:
+ *         public: [include]
+ *       compile_options:
+ *         linux: [-O2, -Wall]
+ *       link_options:
+ *         linux: [-lm]
+ */
+
+import os
+import io
+import yaml
+
+# ── sub-modules ───────────────────────────────────────────────────────────────
+import .intent          # the declaration model (formerly kite/)
+import .utils    { detect_arch, log_info, log_ok, log_warn,
+                   log_error, log_header, is_windows, is_macos, is_linux }
+import .executor { BuildExecutor }
+import .actions  { TestRunner, Installer, DepsInstaller, Cleaner }
+
+# ── CLI argument parser ───────────────────────────────────────────────────────
+
+class Args {
+  var command  = 'build'
+  var config   = 'build.yaml'
+  var profile  = 'debug'
+  var targets  = []      # empty = all
+  var prefix   = nil
+  var verbose  = false
+  var dry_run  = false
+  var jobs     = 1
+  var full     = false   # for clean
+
+  Args() {}
+
+  static parse(argv) {
+    var a = Args()
+    var i = 0
+
+    # First positional arg is the command
+    if argv.length() > 1 and !argv[1].starts_with('-') {
+      a.command = argv[1]
+      i = 2
+    }
+
+    while i < argv.length() {
+      var arg = argv[i]
+
+      if arg == '--config' or arg == '-c' {
+        i++; a.config = argv[i]
+      } else if arg == '--profile' or arg == '-p' {
+        i++; a.profile = argv[i]
+      } else if arg == '--target' or arg == '-t' {
+        i++; a.targets.append(argv[i])
+      } else if arg == '--prefix' {
+        i++; a.prefix = argv[i]
+      } else if arg == '--jobs' or arg == '-j' {
+        i++; a.jobs = to_number(argv[i])
+      } else if arg == '--verbose' or arg == '-v' {
+        a.verbose = true
+      } else if arg == '--dry-run' or arg == '-n' {
+        a.dry_run = true
+      } else if arg == '--full' {
+        a.full = true
+      } else if arg == '--release' {
+        a.profile = 'release'
+      } else if arg == '--debug' {
+        a.profile = 'debug'
+      } else if arg == '--help' or arg == '-h' {
+        a.command = 'help'
+      } else if !arg.starts_with('-') and a.command == 'build' {
+        # Bare target name shorthand: kite.zu coroutine
+        a.targets.append(arg)
+      }
+      i++
+    }
+
+    return a
+  }
+}
+
+# ── Config loading ────────────────────────────────────────────────────────────
+
+def load_config(config_path) {
+  if !file(config_path).exists() {
+    log_error('Config file not found: ${config_path}')
+    log_info('Create a build.yaml in the current directory, or use --config <path>')
+    raise Exception('kite: missing config file')
+  }
+
+  var raw = nil
+  catch {
+    raw = yaml.load_file(config_path).first()
+  } as e
+
+  if e {
+    log_error('Failed to parse ${config_path}: ${e}')
+    raise Exception('kite: YAML parse error')
+  }
+
+  if !raw {
+    raise Exception('kite: ${config_path} is empty or invalid')
+  }
+
+  return raw
+}
+
+# ── Platform context ──────────────────────────────────────────────────────────
+
+def make_context(profile_name) {
+  var os_name   = is_windows ? 'windows' : (is_macos ? 'macos' : 'linux')
+  var arch      = detect_arch()
+  var compiler  = 'cc'   # will be resolved per-target by Toolchain
+
+  # Detect default compiler for context predicate matching
+  if is_windows {
+    compiler = 'msvc'
+  } else if is_macos {
+    var clang = os.exec('clang --version 2>/dev/null')
+    compiler  = clang.exit_code == 0 ? 'clang' : 'gcc'
+  } else {
+    var gcc = os.exec('gcc --version 2>/dev/null')
+    compiler = gcc.exit_code == 0 ? 'gcc' : 'clang'
+  }
+
+  var context = intent.PlatformContext.detect()
+  context.profile = profile_name
+  return context
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_build(args, project, ctx) {
+  log_header('kite build  [profile=${args.profile}]')
+
+  # Validate
+  var env_dict = {}
+  for key, _ in project.env {
+    var val = os.get_env(key, nil)
+    if val { env_dict[key] = val }
+  }
+
+  var errors = project.validate('1.0.0', nil, env_dict)
+  if errors.length() > 0 {
+    for e in errors { log_error(e) }
+    raise Exception('kite: validation failed')
+  }
+
+  # Resolve plans
+  var only  = args.targets.length() > 0 ? args.targets : nil
+  var plans = project.resolve(ctx, args.profile, only)
+
+  if plans.length() == 0 {
+    log_warn('No targets to build')
+    return {}
+  }
+
+  # Execute
+  var executor = BuildExecutor(os.cwd(), {
+    'verbose': args.verbose,
+    'jobs':    args.jobs,
+    'dry_run': args.dry_run,
+  })
+  var results = executor.execute(plans, ctx, project.hooks)
+
+  # Index plans by name for later use by other commands
+  var plans_by_name = {}
+  for plan in plans { plans_by_name[plan.target_name] = plan }
+
+  return { 'results': results, 'plans_by_name': plans_by_name, 'plans': plans }
+}
+
+def cmd_test(args, project, ctx) {
+  # Build first (test targets only unless --target given)
+  var build = cmd_build(args, project, ctx)
+  if !build or !build.contains('results') { return }
+
+  var runner = TestRunner(os.cwd(), args.verbose)
+  runner.run(build['results'], build['plans_by_name'])
+}
+
+def cmd_clean(args, project, ctx) {
+  log_header('kite clean')
+
+  var only  = args.targets.length() > 0 ? args.targets : nil
+  var plans = project.resolve(ctx, args.profile, only)
+
+  var cleaner = Cleaner(os.cwd())
+  cleaner.clean(plans, args.full)
+}
+
+def cmd_install(args, project, ctx) {
+  # Build first
+  var build = cmd_build(args, project, ctx)
+  if !build or !build.contains('results') { return }
+
+  var prefix    = args.prefix ? args.prefix :
+                  (is_windows ? 'C:\\kite' : '/usr/local')
+  var installer = Installer(os.cwd(), prefix, args.verbose)
+  var post_hooks = project.hooks ? project.hooks.all_for('post_install') : []
+  installer.install(build['results'], build['plans_by_name'], post_hooks)
+}
+
+def cmd_deps(args, project, ctx) {
+  var only  = args.targets.length() > 0 ? args.targets : nil
+  var plans = project.resolve(ctx, args.profile, only)
+
+  var di = DepsInstaller(os.cwd(), args.dry_run)
+  di.install(plans)
+}
+
+def cmd_targets(args, project, ctx) {
+  log_header('Targets in ${args.config}')
+
+  var order = project.build_order()
+  for name in order {
+    var t = project._resolved_targets[name]
+    echo '  ${name.pad_end(24)} [${t.type}]'
+  }
+}
+
+def cmd_help() {
+  echo '
+kite — declarative C build system for Zuri
+
+USAGE
+  zuri kite.zu <command> [options]
+
+COMMANDS
+  build    Compile and link targets                (default)
+  test     Build and run test targets
+  clean    Remove build artifacts
+  install  Install artifacts to prefix
+  deps     Install OS package_dependencies
+  targets  List all declared targets
+  help     Show this help
+
+OPTIONS
+  --config  <path>   Path to build.yaml  [default: build.yaml]
+  --profile <name>   Build profile       [default: debug]
+  --target  <name>   Specific target(s)  [may repeat]
+  --prefix  <path>   Install prefix      [default: /usr/local]
+  --verbose          Print every command
+  --dry-run          Print without executing
+  --jobs    <n>      Parallel jobs       [default: 1]
+  --full             Full clean (includes cache)
+  --release          Shorthand for --profile release
+  --debug            Shorthand for --profile debug
+
+EXAMPLES
+  zuri kite.zu                           # debug build, all targets
+  zuri kite.zu build --release           # release build
+  zuri kite.zu build --target coroutine  # one target only
+  zuri kite.zu test --verbose
+  zuri kite.zu install --prefix /usr/local
+  zuri kite.zu clean --full
+  zuri kite.zu deps --dry-run
+'
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() {
+  catch {
+    var args    = Args.parse(os.args[1,])   # strip the script name
+    var cwd     = os.cwd()
+
+    if args.command == 'help' { cmd_help(); return }
+
+    # Resolve config path (may be relative to cwd)
+    var config_path = args.config.starts_with('/') or
+                      (args.config.length() > 2 and args.config[1] == ':') ?
+        args.config :
+        os.join_paths(cwd, args.config)
+
+    # Load and parse
+    var raw     = load_config(config_path)
+    var project = intent.Project.from_raw(raw)
+    var ctx     = make_context(args.profile)
+
+    log_info('Project: ${project.name}' +
+            (project.version ? ' v${project.version.to_string()}' : ''))
+    log_info('Platform: ${ctx.os}/${ctx.arch}')
+    log_info('Compiler: ${ctx.compiler}')
+    log_info('Profile: ${ctx.profile}')
+
+    if      args.command == 'build'   { cmd_build(args, project, ctx)   }
+    else if args.command == 'test'    { cmd_test(args, project, ctx)    }
+    else if args.command == 'clean'   { cmd_clean(args, project, ctx)   }
+    else if args.command == 'install' { cmd_install(args, project, ctx) }
+    else if args.command == 'deps'    { cmd_deps(args, project, ctx)    }
+    else if args.command == 'targets' { cmd_targets(args, project, ctx) }
+    else {
+      log_error('Unknown command: ${args.command}')
+      cmd_help()
+      raise Exception('kite: unknown command')
+    }
+  } as error
+
+  if error {
+    echo error.message
+    echo error.stacktrace
+    os.exit(1)
+  }
+}
+
+main()

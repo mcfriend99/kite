@@ -1,0 +1,12 @@
+#!/bin/bash
+
+if [[ ! $(command -v zuri) ]]; then
+  echo "Zuri is not installed or not in path."
+  exit 1
+fi
+
+ROOT=$(dirname "$0")
+KITE_APP_CLI="$ROOT/cli.zu"
+ZURI_EXE=`which zuri`
+
+exec "$ZURI_EXE" "run" "$KITE_APP_CLI" "$@"

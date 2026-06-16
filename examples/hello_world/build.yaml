@@ -1,0 +1,10 @@
+name: hello_world
+
+targets:
+  hello:
+    type: executable
+    std: c11
+    output_name:
+      "*": hello_world
+    sources:
+      "*": ["*.c"]

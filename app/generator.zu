@@ -1,0 +1,167 @@
+/**
+ * kite/generator.zu
+ *
+ * GeneratorRunner  —  executes pre-build code generation steps declared
+ * under `generators:` in a target block.
+ *
+ * A step is skipped when all its outputs exist and are newer than all
+ * its inputs (standard make-style staleness check).
+ *
+ * Supported tool resolution:
+ *   - Bare names ("flex", "bison", "protoc") → located via PATH
+ *   - Relative paths ("scripts/gen.py")      → resolved from project root
+ *   - Absolute paths                          → used directly
+ *   - Known interpreters: .py → python3/python, .js → node, .sh → sh
+ */
+
+import os
+import .utils {
+  find_app_in_path, mkdirp, needs_rebuild,
+  log_info, log_step, log_ok, log_error, log_cmd,
+  is_windows, build_command
+}
+
+class GeneratorRunner {
+
+  var _project_root = ''
+  var _verbose      = false
+
+  GeneratorRunner(project_root, verbose) {
+    self._project_root = project_root
+    self._verbose      = verbose ? verbose : false
+  }
+
+  /**
+   * Run all generator steps for a target.
+   * Returns the number of steps that actually executed (0 = all up-to-date).
+   */
+  run_all(generators) {
+    var ran = 0
+    for step in generators {
+      if self._run_step(step) { ran++ }
+    }
+    return ran
+  }
+
+  _run_step(step) {
+    var inputs  = step.inputs.map(@(p) { return self._abs(p) })
+    var outputs = step.outputs.map(@(p) { return self._abs(p) })
+
+    # Staleness check: skip if all outputs exist and newer than all inputs
+    if self._is_up_to_date(inputs, outputs) {
+      log_info('generator up-to-date: ${step.tool}')
+      return false
+    }
+
+    log_step('generator: ${step.tool}')
+
+    # Ensure output directories exist
+    for out in outputs {
+      mkdirp(os.dir_name(out))
+    }
+
+    var argv = self._build_argv(step, inputs, outputs)
+    if self._verbose { log_cmd(build_command(argv)) }
+
+    var cmd    = build_command(argv)
+    var result = os.exec(cmd)
+
+    if result.exit_code != 0 {
+      log_error('Generator failed: ${step.tool}')
+      log_error(result.output)
+      raise Exception('kite: generator step failed — ${step.tool}')
+    }
+
+    log_ok('generator: ${step.tool}')
+    return true
+  }
+
+  _is_up_to_date(inputs, outputs) {
+    # If any output is missing, not up-to-date
+    for out in outputs {
+      if !file(out).exists() { return false }
+    }
+
+    # If any input is newer than any output, not up-to-date
+    for out in outputs {
+      for inp in inputs {
+        if needs_rebuild(inp, out) { return false }
+      }
+    }
+    return true
+  }
+
+  _build_argv(step, abs_inputs, abs_outputs) {
+    var tool   = step.tool
+    var args   = step.args ? step.args : []
+
+    # Resolve the tool binary
+    var binary = self._resolve_tool(tool)
+
+    var argv = [binary]
+    argv.extend(args)
+    argv.extend(abs_inputs)
+    return argv
+  }
+
+  _resolve_tool(tool) {
+    # Absolute path — use directly
+    if tool.starts_with('/') or
+       (tool.length() > 2 and tool[1] == ':') {  # Windows drive letter
+      if file(tool).exists() { return tool }
+      raise Exception('kite: generator tool not found at absolute path: ${tool}')
+    }
+
+    # Relative path (starts with ./ or contains /) — resolve from project root
+    if tool.starts_with('./') or tool.starts_with('../') or
+       (tool.contains('/') and !tool.contains('..')) {
+      var abs = os.join_paths(self._project_root, tool)
+      if file(abs).exists() {
+        return self._wrap_interpreter(abs)
+      }
+      raise Exception('kite: generator script not found: ${abs}')
+    }
+
+    # Bare name — search PATH
+    var found = find_app_in_path(tool)
+    if found { return found }
+
+    # Last resort: check if it looks like a script in the project
+    var project_tool = os.join_paths(self._project_root, tool)
+    if file(project_tool).exists() {
+      return self._wrap_interpreter(project_tool)
+    }
+
+    raise Exception('kite: generator tool "${tool}" not found in PATH or project')
+  }
+
+  /**
+   * For script files, prepend the appropriate interpreter.
+   * Returns a string that, when split, gives [interpreter, script_path].
+   * Actually returns just the tool path; argv assembly handles the rest.
+   */
+  _wrap_interpreter(script_path) {
+    if script_path.ends_with('.py') {
+      var py = find_app_in_path('python3')
+      if !py { py = find_app_in_path('python') }
+      if py { return py + ' ' + script_path }
+    }
+    if script_path.ends_with('.js') {
+      var node = find_app_in_path('node')
+      if node { return node + ' ' + script_path }
+    }
+    if script_path.ends_with('.sh') {
+      return 'sh ' + script_path
+    }
+    # Assume executable
+    return script_path
+  }
+
+  _abs(path) {
+    if path.starts_with('/') or
+       (path.length() > 2 and path[1] == ':') {
+      return path
+    }
+    return os.join_paths(self._project_root, path)
+  }
+}

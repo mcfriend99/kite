@@ -1,0 +1,17 @@
+import ..app.intent.platform {
+  PlatformContext, PlatformMap
+}
+
+test('Platform Map', @{
+  it('should resolve values for current platform context', @{
+    var map = PlatformMap()
+    map.set('*', ['-Wall'])
+    map.set('linux', ['-O2', '-fstack-protector-strong'])
+    map.set('linux && arm64', ['-march=armv8-a+crypto'])
+    map.set('windows', ['/W3'])
+
+    var ctx = PlatformContext.detect()
+
+    expect(map.resolve(ctx)).to_be(['-Wall', '-O2', '-fstack-protector-strong'])
+  })
+})

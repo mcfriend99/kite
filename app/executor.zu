@@ -1,0 +1,367 @@
+/**
+ * kite/executor.zu
+ *
+ * BuildExecutor  —  the heart of the build system.
+ *
+ * Given a list of BuildPlan objects (from Project.resolve()) it:
+ *   1. Runs generator steps
+ *   2. Expands source globs
+ *   3. Computes object file paths
+ *   4. Compiles only stale sources (incremental)
+ *   5. Links only when necessary (incremental)
+ *   6. Collects compile_commands.json entries
+ *   7. Runs hooks (pre_build / post_build)
+ *   8. Reports timing and summary
+ */
+
+import os
+import io
+import reflect
+import json
+import .utils {
+  expand_globs, mkdirp, shell_quote, build_command,
+  log_info, log_ok, log_warn, log_error, log_step,
+  log_header, log_cmd, is_windows, is_macos, is_linux
+}
+import .toolchain  { Toolchain, CompileCommand }
+import .cache      { BuildCache }
+import .generator  { GeneratorRunner }
+import .fetcher { Fetcher }
+
+# ── BuildResult ───────────────────────────────────────────────────────────────
+
+class BuildResult {
+  var target_name = ''
+  var success     = false
+  var artifact    = ''      # path to the produced file
+  var target_type = ''
+  var skipped     = false   # true = already up-to-date
+  var duration_ms = 0
+
+  BuildResult(name) {
+    self.target_name = name
+  }
+}
+
+# ── BuildExecutor ─────────────────────────────────────────────────────────────
+
+class BuildExecutor {
+
+  var _project_root = ''
+  var _build_dir    = ''     # e.g. .kite/build
+  var _obj_dir      = ''     # e.g. .kite/build/obj
+  var _toolchain    = nil
+  var _cache        = nil
+  var _gen_runner   = nil
+  var _verbose      = false
+  var _jobs         = 1      # parallel jobs (future: thread pool)
+  var _dry_run      = false
+  var _cc_entries   = []     # compile_commands.json entries accumulated
+
+  BuildExecutor(project_root, options) {
+    self._project_root = project_root
+    self._verbose      = options.get('verbose',  false)
+    self._jobs         = options.get('jobs',     1)
+    self._dry_run      = options.get('dry_run',  false)
+
+    self._build_dir    = os.join_paths(project_root, '.kite', 'build')
+    self._obj_dir      = os.join_paths(self._build_dir, 'obj')
+
+    mkdirp(self._build_dir)
+    mkdirp(self._obj_dir)
+  }
+
+  /**
+   * Execute a full build for the given list of BuildPlan objects.
+   * Plans must already be in dependency-correct topological order.
+   *
+   * Returns a list of BuildResult objects.
+   */
+  execute(plans, ctx, hooks) {
+    # Initialise toolchain and cache with the first plan's compiler
+    var first_compiler = plans.length() > 0 ? plans[0].compiler : 'cc'
+    self._toolchain = Toolchain(ctx)
+    self._cache     = BuildCache(self._build_dir)
+    self._gen_runner = GeneratorRunner(self._project_root, self._verbose)
+
+    # Run fetchers first...
+    var fetcher = Fetcher(self._project_root, self._verbose)
+    fetcher.run(hooks, ctx)
+
+    self._run_hooks(hooks, 'pre_build')
+
+    var results   = []
+    var artifacts = {}   # target_name → BuildResult  (for dep resolution)
+
+    for plan in plans {
+      var result = self._build_target(plan, artifacts)
+      results.append(result)
+      if result.success and result.artifact != '' {
+        artifacts[plan.target_name] = result
+      }
+    }
+
+    self._cache.prune()
+    self._cache.save()
+
+    # Write compile_commands.json
+    if self._cc_entries.length() > 0 {
+      self._write_compile_commands()
+    }
+
+    self._run_hooks(hooks, 'post_build')
+
+    self._print_summary(results)
+    return results
+  }
+
+  # ── Per-target build ───────────────────────────────────────────────────
+
+  _build_target(plan, artifacts) {
+    log_header('${plan.target_name}  [${plan.target_type}]')
+
+    var result       = BuildResult(plan.target_name)
+    result.target_type = plan.target_type
+    result.artifact    = plan.output_path
+
+    var t_start = time()
+
+    # Skip header-only targets
+    if plan.target_type == 'header_only' {
+      log_info('header-only target — nothing to build')
+      result.success = true
+      result.skipped = true
+      result.duration_ms = 0
+      return result
+    }
+
+    catch {
+      # 1. Run generators
+      var gen_count = self._gen_runner.run_all(plan.generators)
+      if gen_count > 0 {
+        log_info('${gen_count} generator(s) ran')
+      }
+
+      # 2. Expand sources
+      var sources = self._resolve_sources(plan)
+      if sources.length() == 0 and plan.target_type != 'header_only' {
+        log_warn('No source files found for target ${plan.target_name}')
+      }
+
+      # 3. Compile
+      var objects       = []
+      var any_compiled  = false
+      var cc_commands   = []
+
+      for src in sources {
+        var obj = self._obj_path(plan.target_name, src)
+        mkdirp(os.dir_name(obj))
+
+        var cc  = self._toolchain.make_compile_command(plan, src, obj)
+        cc_commands.append(cc)
+
+        # Accumulate for compile_commands.json
+        self._cc_entries.append(cc.to_compile_commands_entry(self._project_root))
+
+        if self._cache.needs_compile(src, obj, cc.flags) {
+          log_step('compile  ${self._rel(src)}')
+          if self._verbose { log_cmd(cc.cmd_string()) }
+
+          if !self._dry_run {
+            var res = os.exec(cc.cmd_string())
+            if res.exit_code != 0 {
+              log_error('Compile failed: ${self._rel(src)}')
+              echo res.output
+              raise Exception('kite: compilation error in ${src}')
+            }
+            self._cache.record_compile(src, obj, cc.flags)
+          }
+          any_compiled = true
+        } else {
+          if self._verbose { log_info('up-to-date ${self._rel(src)}') }
+        }
+
+        objects.append(obj)
+      }
+
+      # 4. Resolve dependency artifacts for linking
+      var dep_artifacts = self._collect_dep_artifacts(plan, artifacts)
+
+      # 5. Link / archive
+      var artifact_exists = file(plan.output_path).exists()
+
+      var link_cmd = self._toolchain.make_link_command(plan, objects, dep_artifacts)
+      var needs_link = any_compiled or
+                       !artifact_exists or
+                       self._cache.needs_link(
+                         plan.target_name, plan.output_path,
+                         objects, link_cmd.flags)
+
+      if needs_link {
+        mkdirp(os.dir_name(plan.output_path))
+        log_step('link     ${self._rel(plan.output_path)}')
+        if self._verbose { log_cmd(link_cmd.cmd_string()) }
+
+        if !self._dry_run {
+          var res = os.exec(link_cmd.cmd_string())
+          if res.exit_code != 0 {
+            log_error('Link failed: ${plan.target_name}')
+            echo res.output
+            raise Exception('kite: link error for target ${plan.target_name}')
+          }
+          self._cache.record_link(
+            plan.target_name, plan.output_path, objects, link_cmd.flags)
+        }
+      } else {
+        log_info('up-to-date → ${self._rel(plan.output_path)}')
+        result.skipped = true
+      }
+
+      result.success    = true
+      result.duration_ms = (time() - t_start) * 1000
+
+      if !result.skipped {
+        log_ok('${plan.target_name} → ${self._rel(plan.output_path)}')
+      }
+
+    } as e 
+    
+    if e {
+      result.success    = false
+      result.duration_ms = (time() - t_start) * 1000
+      log_error('Target ${plan.target_name} failed: ${e.message}')
+    }
+
+    return result
+  }
+
+  # ── Source resolution ──────────────────────────────────────────────────
+
+  _resolve_sources(plan) {
+    # Gather all patterns (from plan) + any generator outputs
+    var patterns = plan.source_patterns[,]
+    for gen in plan.generators {
+      for out in gen.outputs {
+        var ext = out.split('.').last()
+        if ['c', 'cpp', 'cc', 'cxx', 'c++', 'm', 'mm'].contains(ext) {
+          patterns.append(out)
+        }
+      }
+    }
+
+    return expand_globs(self._project_root, patterns, plan.source_excludes)
+  }
+
+  # ── Object path computation ────────────────────────────────────────────
+
+  /**
+   * Compute a stable object file path that:
+   *   - lives under _obj_dir/<target_name>/
+   *   - preserves enough of the source path to avoid collisions
+   *   - uses .obj on Windows, .o elsewhere
+   */
+  _obj_path(target_name, src_path) {
+    var rel  = src_path.replace(self._project_root, '').ltrim('/').ltrim('\\')
+    var safe = rel.replace('/', '_').replace('\\', '_').replace('..', '__', false)
+    var ext  = is_windows ? '.obj' : '.o'
+    return os.join_paths(self._obj_dir, target_name, safe + ext)
+  }
+
+  # ── Dependency artifact resolution ────────────────────────────────────
+
+  _collect_dep_artifacts(plan, artifacts) {
+    var deps = []
+    for dep_name in plan.link_targets {
+      var dep_result = artifacts.get(dep_name, nil)
+      if dep_result and dep_result.artifact != '' {
+        deps.append({
+          'path': dep_result.artifact,
+          'type': dep_result.target_type,
+        })
+      }
+    }
+    return deps
+  }
+
+  # ── Hooks ──────────────────────────────────────────────────────────────
+
+  _run_hooks(hooks, phase) {
+    if !hooks { return }
+    var cmds = hooks.all_for(phase)
+    if cmds.length() == 0 { return }
+
+    log_header('hook: ${phase}')
+    for cmd in cmds {
+      var abs_cmd = os.join_paths(self._project_root, cmd)
+      var run_cmd = file(abs_cmd).exists() ? abs_cmd : cmd
+      log_step(run_cmd)
+      if self._verbose { log_cmd(run_cmd) }
+
+      if !self._dry_run {
+
+        # Automatically run Zuri scripts without going through the CLI in case 
+        # there's no standalone Zuri installation
+        if run_cmd == abs_cmd and run_cmd.ends_with('.zu') {
+          reflect.run_script(abs_cmd)
+          continue
+        }
+
+        var res = os.exec(run_cmd)
+        if res.exit_code != 0 {
+          log_error('Hook failed: ${cmd}')
+          echo res.output
+          raise Exception('kite: hook "${cmd}" exited with code ${res.exit_code}')
+        }
+        if self._verbose and res.output.trim() != '' {
+          echo res.output
+        }
+      }
+    }
+  }
+
+  # ── compile_commands.json ──────────────────────────────────────────────
+
+  _write_compile_commands() {
+    catch {
+      var path    = os.join_paths(self._project_root, 'compile_commands.json')
+      var content = json.encode(self._cc_entries)
+      file(path, 'w').write(content)
+      log_info('compile_commands.json updated (${self._cc_entries.length()} entries)')
+    } as e 
+    if e {
+      log_warn('Could not write compile_commands.json: ${e}')
+    }
+  }
+
+  # ── Helpers ────────────────────────────────────────────────────────────
+
+  _rel(path) {
+    return path.replace(self._project_root, '').ltrim('/').ltrim('\\')
+  }
+
+  # ── Summary ────────────────────────────────────────────────────────────
+
+  _print_summary(results) {
+    log_header('Summary')
+    var ok      = 0
+    var skipped = 0
+    var failed  = 0
+
+    for r in results {
+      if !r.success {
+        log_error('  FAIL  ${r.target_name}')
+        failed++
+      } else if r.skipped {
+        log_info('  SKIP  ${r.target_name}  (up-to-date)')
+        skipped++
+      } else {
+        log_ok('  OK    ${r.target_name}  (${r.duration_ms}ms)')
+        ok++
+      }
+    }
+
+    echo ''
+    echo '  Built: ${ok}  Skipped: ${skipped}  Failed: ${failed}'
+    if failed > 0 { raise Exception('kite: build failed') }
+  }
+}

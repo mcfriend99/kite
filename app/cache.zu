@@ -1,0 +1,208 @@
+/**
+ * kite/cache.zu
+ *
+ * BuildCache  —  persistent incremental build cache.
+ *
+ * Stores a JSON file at <build_dir>/.kite_cache.json containing:
+ *   {
+ *     "sources": {
+ *       "/abs/path/to/foo.c": {
+ *         "hash":   "md5hex",
+ *         "object": "/abs/path/to/foo.c.o",
+ *         "flags_hash": "md5hex of compile flags"
+ *       }
+ *     },
+ *     "targets": {
+ *       "coroutine": {
+ *         "artifact": "/abs/path/dist/coroutine.so",
+ *         "link_hash": "md5hex of link inputs"
+ *       }
+ *     }
+ *   }
+ *
+ * A source file needs recompilation when:
+ *   1. Its content hash has changed, OR
+ *   2. Its compile flags hash has changed, OR
+ *   3. Its object file no longer exists.
+ *
+ * A target needs re-linking when:
+ *   1. Any of its object files were recompiled, OR
+ *   2. Its artifact no longer exists, OR
+ *   3. The set of link flags changed.
+ */
+
+import os
+import hash
+import json
+
+def _md5(text) {
+  return hash.md5(text)
+}
+
+def _file_md5(path) {
+  catch {
+    return hash.md5(file(path, 'rb').read())
+  }
+  return ''
+}
+
+class BuildCache {
+
+  var _path     = ''    # path to .kite_cache.json
+  var _data     = {}    # the in-memory dict
+  var _dirty    = false
+
+  BuildCache(build_dir) {
+    self._path = os.join_paths(build_dir, '.kite_cache.json')
+    self._load()
+  }
+
+  # ── Persistence ───────────────────────────────────────────────────────
+
+  _load() {
+    catch {
+      var content = file(self._path, 'r').read()
+      self._data = json.decode(content)
+    } as e 
+    if e {
+      self._data = { 'sources': {}, 'targets': {} }
+    }
+
+    if !self._data.contains('sources') { 
+      self._data['sources'] = {} 
+    }
+    if !self._data.contains('targets') { 
+      self._data['targets'] = {} 
+    }
+  }
+
+  save() {
+    if !self._dirty { 
+      return 
+    }
+
+    catch {
+      file(self._path, 'w').write(json.encode(self._data))
+      self._dirty = false
+    } as _
+
+    # Non-fatal; next build will just recompile everything
+  }
+
+  # ── Source file tracking ──────────────────────────────────────────────
+
+  /**
+   * Determine whether a source file needs recompilation.
+   * Returns true if a fresh compilation is required.
+   */
+  needs_compile(src_path, obj_path, flags) {
+    # Object file must exist
+    if !file(obj_path).exists() { return true }
+
+    var key    = src_path
+    var cached = self._data['sources'].get(key, nil)
+    if !cached { return true }
+
+    # Content changed?
+    var current_hash = _file_md5(src_path)
+    if cached.get('hash', '') != current_hash { return true }
+
+    # Flags changed?
+    var flags_hash = _md5(' '.join(flags))
+    if cached.get('flags_hash', '') != flags_hash { return true }
+
+    # Object file path changed?
+    if cached.get('object', '') != obj_path { return true }
+
+    return false
+  }
+
+  /**
+   * Record that a source file was successfully compiled.
+   */
+  record_compile(src_path, obj_path, flags) {
+    self._data['sources'][src_path] = {
+      'hash':       _file_md5(src_path),
+      'object':     obj_path,
+      'flags_hash': _md5(' '.join(flags)),
+    }
+    self._dirty = true
+  }
+
+  # ── Target tracking ───────────────────────────────────────────────────
+
+  /**
+   * Determine whether a target needs re-linking.
+   * recompiled_objects: set (dict) of object paths that were just compiled.
+   */
+  needs_link(target_name, artifact_path, objects, link_flags) {
+    if !file(artifact_path).exists() { return true }
+
+    var cached = self._data['targets'].get(target_name, nil)
+    if !cached { return true }
+
+    # Link flags changed?
+    var lflags_hash = _md5(' '.join(link_flags))
+    if cached.get('link_hash', '') != lflags_hash { return true }
+
+    # Any object file changed since last link?
+    var cached_objs = cached.get('objects', {})
+    for obj in objects {
+      var obj_hash = _file_md5(obj)
+      if cached_objs.get(obj, '') != obj_hash { return true }
+    }
+
+    return false
+  }
+
+  /**
+   * Record that a target was successfully linked.
+   */
+  record_link(target_name, artifact_path, objects, link_flags) {
+    var obj_hashes = {}
+    for obj in objects {
+      obj_hashes[obj] = _file_md5(obj)
+    }
+    self._data['targets'][target_name] = {
+      'artifact':  artifact_path,
+      'link_hash': _md5(' '.join(link_flags)),
+      'objects':   obj_hashes,
+    }
+    self._dirty = true
+  }
+
+  # ── Invalidation ──────────────────────────────────────────────────────
+
+  /**
+   * Remove all cached data for a specific target (forced rebuild).
+   */
+  invalidate_target(target_name) {
+    if self._data['targets'].contains(target_name) {
+      self._data['targets'].remove(target_name)
+      self._dirty = true
+    }
+  }
+
+  /**
+   * Wipe the entire cache (clean build).
+   */
+  invalidate_all() {
+    self._data = { 'sources': {}, 'targets': {} }
+    self._dirty = true
+    self.save()
+  }
+
+  /**
+   * Remove stale entries for source files that no longer exist.
+   */
+  prune() {
+    var to_remove = []
+    for path, _ in self._data['sources'] {
+      if !file(path).exists() { to_remove.append(path) }
+    }
+    for path in to_remove {
+      self._data['sources'].remove(path)
+      self._dirty = true
+    }
+  }
+}

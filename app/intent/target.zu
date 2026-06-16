@@ -1,0 +1,531 @@
+/**
+ * kite/intent/target.zu
+ *
+ * Target  —  the central unit of the kite build model.
+ *
+ * One Target corresponds to one build artifact: an executable, shared library,
+ * static library, object library, header-only package, Zuri C extension module,
+ * or a runnable test suite.
+ *
+ * Inheritance (`inherits:`) copies all fields from the named sibling target
+ * and then applies the current target's overrides on top.  List fields
+ * (sources, compile_options, etc.) are merged; scalar fields are replaced.
+ */
+
+import .platform { PlatformMap }
+import .types    { LanguageStandard, OutputName }
+import .sources  { SourceSet, IncludeSet, DefineSet,
+                   FileOptions, GeneratorStep,
+                   SystemLib, PackageDeps }
+import .build    { TestConfig, InstallManifest }
+import .sources { DefineSet, SourceSet, IncludeSet, FileOptions, PackageDeps }
+
+# ── TargetType ────────────────────────────────────────────────────────────────
+
+/**
+ * Enumeration of all supported output types.
+ * kite uses this to select the correct linker invocation, output extension,
+ * and install behaviour.
+ */
+class TargetType {
+
+  static var EXECUTABLE    = 'executable'
+  static var SHARED_LIB    = 'shared_library'
+  static var STATIC_LIB    = 'static_library'
+  static var OBJECT_LIB    = 'object_library'
+  static var HEADER_ONLY   = 'header_only'
+  static var ZURI_MODULE   = 'zuri_module'    # shared_library + auto .zu install
+  static var TEST          = 'test'
+
+  static var ALL = [
+    'executable', 'shared_library', 'static_library',
+    'object_library', 'header_only', 'zuri_module', 'test',
+  ]
+
+  static validate(type) {
+    if !TargetType.ALL.contains(type) {
+      raise Exception('kite: unknown target type "${type}". Valid types: ${TargetType.ALL}')
+    }
+  }
+
+  /** Returns true for types that produce a linkable binary artifact. */
+  static is_linkable(type) {
+    return type == TargetType.EXECUTABLE   or
+           type == TargetType.SHARED_LIB   or
+           type == TargetType.ZURI_MODULE  or
+           type == TargetType.TEST
+  }
+
+  /** Returns true for types that can be linked against by other targets. */
+  static is_library(type) {
+    return type == TargetType.SHARED_LIB  or
+           type == TargetType.STATIC_LIB  or
+           type == TargetType.OBJECT_LIB  or
+           type == TargetType.ZURI_MODULE or
+           type == TargetType.HEADER_ONLY
+  }
+
+  /**
+   * Platform-aware output file extension for a given type.
+   * e.g. shared_library → .so (linux) / .dylib (macos) / .dll (windows)
+   */
+  static extension(type, os) {
+    if type == TargetType.EXECUTABLE or type == TargetType.TEST {
+      return os == 'windows' ? '.exe' : ''
+    }
+    if type == TargetType.SHARED_LIB or type == TargetType.ZURI_MODULE {
+      if os == 'linux'   { return '.so' }
+      if os == 'macos'   { return '.dylib' }
+      if os == 'windows' { return '.dll' }
+      return '.so'
+    }
+    if type == TargetType.STATIC_LIB {
+      return os == 'windows' ? '.lib' : '.a'
+    }
+    if type == TargetType.OBJECT_LIB { return '.o' }
+    return ''   # header_only
+  }
+
+  /**
+   * Return the linker flag that tells the compiler to build a shared lib.
+   */
+  static shared_flag(compiler) {
+    if compiler == 'msvc' or compiler == 'cl' { return '/DLL' }
+    return '-shared'
+  }
+}
+
+# ── Target ────────────────────────────────────────────────────────────────────
+
+class Target {
+
+  var name = ''
+  var type = TargetType.EXECUTABLE
+
+  # --- Inheritance ---
+  var inherits = nil   # name of a sibling target to inherit from (string|nil)
+
+  # --- Identity ---
+  var output_name = nil   # OutputName or nil (defaults to target name)
+  var output_dir  = nil   # string or nil (falls back to ProjectDefaults.output_dir)
+
+  # --- Language ---
+  var std = nil   # LanguageStandard or nil (falls back to ProjectDefaults.std)
+
+  # --- Toolchain (override ProjectDefaults) ---
+  var compiler = nil   # PlatformMap or nil
+  var linker   = nil   # PlatformMap or nil
+
+  # --- Sources ---
+  var sources      = nil   # SourceSet
+  var includes     = nil   # IncludeSet
+  var defines      = nil   # DefineSet
+  var file_options = nil   # FileOptions
+
+  # --- Compiler / linker flags ---
+  var compile_options = nil   # PlatformMap
+  var link_options    = nil   # PlatformMap
+
+  # --- Linking ---
+  var link_targets = []   # list of sibling target names (string)
+  var links        = nil  # PlatformMap → list of raw -l flags / .lib names
+
+  # --- External dependencies ---
+  var system_libs         = []   # list of SystemLib
+  var package_dependencies = nil  # PackageDeps
+
+  # --- Code generation ---
+  var generators = []   # list of GeneratorStep
+
+  # --- Test settings (only meaningful when type == 'test') ---
+  var test_config = nil   # TestConfig
+
+  # --- Install ---
+  var install = nil   # InstallManifest
+
+  # --- Defaults (Internal) ---
+  var _defaults = {}
+
+  Target(name) {
+    self.name            = name
+    self.sources         = SourceSet()
+    self.includes        = IncludeSet()
+    self.defines         = DefineSet()
+    self.compile_options = PlatformMap()
+    self.link_options    = PlatformMap()
+    self.links           = PlatformMap()
+    self.file_options    = FileOptions()
+  }
+
+  # ── Factory ───────────────────────────────────────────────────────────
+
+  static from_raw(name, raw) {
+    if !raw { return Target(name) }
+
+    var t = Target(name)
+
+    t.type     = raw.get('type', TargetType.EXECUTABLE)
+    t.inherits = raw.get('inherits', nil)
+
+    TargetType.validate(t.type)
+
+    # identity
+    if raw.contains('output_name') {
+      t.output_name = OutputName.from_raw(raw['output_name'])
+    }
+    t.output_dir = raw.get('output_dir', nil)
+
+    # language
+    if raw.contains('std') {
+      t.std = LanguageStandard.from_raw(raw['std'])
+    }
+
+    # toolchain
+    if raw.contains('compiler') {
+      t.compiler = PlatformMap.from_raw(raw['compiler'])
+    }
+    if raw.contains('linker') {
+      t.linker = PlatformMap.from_raw(raw['linker'])
+    }
+
+    # sources
+    if raw.contains('sources') {
+      t.sources = SourceSet.from_raw(raw['sources'])
+    }
+    if raw.contains('includes') {
+      t.includes = IncludeSet.from_raw(raw['includes'])
+    }
+    if raw.contains('defines') {
+      t.defines = DefineSet.from_raw(raw['defines'])
+    }
+    if raw.contains('file_options') {
+      t.file_options = FileOptions.from_raw(raw['file_options'])
+    }
+
+    # flags
+    if raw.contains('compile_options') {
+      t.compile_options = PlatformMap.from_raw(raw['compile_options'])
+    }
+    if raw.contains('link_options') {
+      t.link_options = PlatformMap.from_raw(raw['link_options'])
+    }
+
+    # linking
+    t.link_targets = raw.get('link_targets', [])
+    if raw.contains('links') {
+      t.links = PlatformMap.from_raw(raw['links'])
+    }
+
+    # external deps
+    if raw.contains('system_libs') {
+      t.system_libs = SystemLib.list_from_raw(raw['system_libs'])
+    }
+    if raw.contains('package_dependencies') {
+      t.package_dependencies = PackageDeps.from_raw(raw['package_dependencies'])
+    }
+
+    # generators
+    if raw.contains('generators') {
+      t.generators = GeneratorStep.list_from_raw(raw['generators'])
+    }
+
+    # test config
+    if t.type == TargetType.TEST {
+      t.test_config = TestConfig.from_raw(raw)
+    }
+
+    # install
+    if raw.contains('install') {
+      t.install = InstallManifest.from_raw(raw['install'])
+    }
+
+    return t
+  }
+
+  static map_from_raw(raw) {
+    if !raw { return {} }
+    var targets = {}
+    for name, data in raw {
+      targets[name] = Target.from_raw(name, data)
+    }
+    return targets
+  }
+
+  # ── Inheritance resolution ────────────────────────────────────────────
+
+  /**
+   * Return a new Target that is the result of merging `root` (base)
+   * with `self` (override).  List fields are merged; scalars from self win.
+   * Called by Project.resolve_target() after all targets are loaded.
+   */
+  resolved_with(root) {
+    var t = Target(self.name)
+
+    # scalar fields: self wins if set, otherwise inherit from parent
+    t.type       = self.type
+    t.inherits   = nil   # resolved; no longer needed
+    t.output_name = self.output_name ? self.output_name : root.output_name
+    t.output_dir  = self.output_dir  ? self.output_dir  : root.output_dir
+    t.std         = self.std         ? self.std          : root.std
+    t.test_config = self.test_config ? self.test_config  : root.test_config
+    t.install     = self.install     ? self.install      : root.install
+
+    # PlatformMap fields: merge parent entries first, then self entries
+    t.compiler        = self._merge_maps(root.compiler,        self.compiler)
+    t.linker          = self._merge_maps(root.linker,          self.linker)
+    t.compile_options = self._merge_maps(root.compile_options, self.compile_options)
+    t.link_options    = self._merge_maps(root.link_options,    self.link_options)
+    t.links           = self._merge_maps(root.links,           self.links)
+
+    # DefineSet: merge
+    t.defines = self._merge_defines(root.defines, self.defines)
+
+    # SourceSet: merge patterns, self excludes win
+    t.sources = self._merge_sources(root.sources, self.sources)
+
+    # IncludeSet: merge public and private separately
+    t.includes = self._merge_includes(root.includes, self.includes)
+
+    # FileOptions: self entries override parent entries for same path
+    t.file_options = self._merge_file_options(root.file_options, self.file_options)
+
+    # Lists: concatenate
+    t.link_targets = root.link_targets + self.link_targets
+    t.system_libs  = root.system_libs  + self.system_libs
+    t.generators   = root.generators   + self.generators
+
+    if self.package_dependencies and root.package_dependencies {
+      t.package_dependencies = self._merge_pkg_deps(
+        root.package_dependencies, self.package_dependencies)
+    } else {
+      t.package_dependencies = self.package_dependencies ?
+                               self.package_dependencies :
+                               root.package_dependencies
+    }
+
+    return t
+  }
+
+  _merge_maps(base, override) {
+    var pm = PlatformMap()
+    if base {
+      for entry in base._entries { pm.set(entry['expr'], entry['value']) }
+    }
+    if override {
+      for entry in override._entries { pm.set(entry['expr'], entry['value']) }
+    }
+    return pm
+  }
+
+  _merge_defines(base, override) {
+    var ds = DefineSet()
+    if base {
+      for entry in base.p_map._entries { ds.p_map.set(entry['expr'], entry['value']) }
+    }
+    if override {
+      for entry in override.p_map._entries { ds.p_map.set(entry['expr'], entry['value']) }
+    }
+    return ds
+  }
+
+  _merge_sources(base, override) {
+    var ss = SourceSet()
+    if base {
+      for entry in base.p_map._entries { ss.p_map.set(entry['expr'], entry['value']) }
+      ss._exclude.extend(base._exclude)
+    }
+    if override {
+      for entry in override.p_map._entries { ss.p_map.set(entry['expr'], entry['value']) }
+      # self excludes extend (not replace) parent excludes
+      ss._exclude.extend(override._exclude)
+    }
+    return ss
+  }
+
+  _merge_includes(base, override) {
+    var inc = IncludeSet()
+    inc.public_map  = self._merge_maps(
+      base ? base.public_map : nil,
+      override ? override.public_map : nil)
+    inc.private_map = self._merge_maps(
+      base ? base.private_map : nil,
+      override ? override.private_map : nil)
+    return inc
+  }
+
+  _merge_file_options(base, override) {
+    var fo = FileOptions()
+    if base {
+      for path, opts in base.overrides  { fo.overrides [path] = opts }
+    }
+    if override {
+      # override wins for same path
+      for path, opts in override.overrides  { fo.overrides [path] = opts }
+    }
+    return fo
+  }
+
+  _merge_pkg_deps(base, override) {
+    var pd = PackageDeps()
+    for key, pkgs in base._entries    { pd._entries[key] = pkgs }
+    for key, pkgs in override._entries { pd._entries[key] = pkgs }
+    return pd
+  }
+
+  # ── Setters (called from outside the target to update its fields) ─────
+  set_defaults(defaults) {
+    self._defaults = defaults
+  }
+
+
+  # ── Resolution helpers (called by the build driver) ───────────────────
+
+  /**
+   * Resolve the effective compiler name for the given platform context,
+   * falling back to project defaults.
+   */
+  effective_compiler(ctx, defaults) {
+    if self.compiler {
+      var c = self.compiler.resolve_one(ctx)
+      if c { return c }
+    }
+    if defaults and defaults.compiler {
+      return defaults.compiler.resolve_one(ctx)
+    }
+    return 'cc'
+  }
+
+  effective_linker(ctx, defaults) {
+    if self.linker {
+      var l = self.linker.resolve_one(ctx)
+      if l { return l }
+    }
+    if defaults and defaults.linker {
+      return defaults.linker.resolve_one(ctx)
+    }
+    return 'cc'
+  }
+
+  effective_output_name(ctx) {
+    if self.output_name {
+      var n = self.output_name.resolve(ctx)
+      if n { return n }
+    }
+    return self.name
+  }
+
+  effective_output_dir(defaults) {
+    if self.output_dir { return self.output_dir }
+    if defaults        { return defaults.output_dir }
+    return 'dist'
+  }
+
+  /**
+   * Fully assembled compiler flags for this target:
+   *   std flags + defines + includes + compile_options + profile options
+   */
+  all_compile_flags(ctx, compiler, profile) {
+    var flags = []
+
+    # 1. Language standard
+    var std = self.std
+    if !std and self._defaults { std = self._defaults.std }
+    if std { flags.extend(std.to_flags(compiler)) }
+
+    # 2. Defines
+    if self.defines { flags.extend(self.defines.to_flags(ctx, compiler)) }
+
+    # 3. Profile defines
+    if profile and profile.defines {
+      flags.extend(profile.defines.to_flags(ctx, compiler))
+    }
+
+    # 4. Include paths (public + private)
+    if self.includes {
+      for path in self.includes.resolve_all(ctx) {
+        var prefix = (compiler == 'msvc' or compiler == 'cl') ? '/I' : '-I'
+        flags.append('${prefix}${path}')
+      }
+    }
+
+    # 5. Target compile options
+    if self.compile_options {
+      flags.extend(self.compile_options.resolve(ctx))
+    }
+
+    # 6. Profile compile options (appended last — highest priority)
+    if profile and profile.compile_options {
+      flags.extend(profile.compile_options.resolve(ctx))
+    }
+
+    return flags
+  }
+
+  /**
+   * Fully assembled linker flags for this target.
+   */
+  all_link_flags(ctx, compiler, profile) {
+    var flags = []
+
+    # 1. Shared library flag
+    if TargetType.is_linkable(self.type) and
+       (self.type == TargetType.SHARED_LIB or
+        self.type == TargetType.ZURI_MODULE) {
+      flags.append(TargetType.shared_flag(compiler))
+    }
+
+    # 2. Raw link flags
+    if self.link_options {
+      flags.extend(self.link_options.resolve(ctx))
+    }
+
+    # 3. System -l flags
+    if self.links {
+      flags.extend(self.links.resolve(ctx))
+    }
+
+    # 4. Profile link flags
+    if profile and profile.link_options {
+      flags.extend(profile.link_options.resolve(ctx))
+    }
+
+    return flags
+  }
+
+  # ── Serialisation ─────────────────────────────────────────────────────
+
+  to_dict() {
+    var out = { 'type': self.type }
+
+    if self.inherits    { out['inherits']    = self.inherits }
+    if self.output_name { out['output_name'] = self.output_name.to_dict() }
+    if self.output_dir  { out['output_dir']  = self.output_dir }
+    if self.std         { out['std']         = self.std.to_dict() }
+
+    if self.compiler        { out['compiler']        = self.compiler.to_dict() }
+    if self.linker          { out['linker']          = self.linker.to_dict() }
+    if self.sources         { out['sources']         = self.sources.to_dict() }
+    if self.includes        { out['includes']        = self.includes.to_dict() }
+    if self.defines         { out['defines']         = self.defines.to_dict() }
+    if self.compile_options { out['compile_options'] = self.compile_options.to_dict() }
+    if self.link_options    { out['link_options']    = self.link_options.to_dict() }
+    if self.file_options    { out['file_options']    = self.file_options.to_dict() }
+
+    if self.link_targets.length() > 0 { out['link_targets'] = self.link_targets }
+    if self.links           { out['links']    = self.links.to_dict() }
+
+    if self.system_libs.length() > 0 {
+      out['system_libs'] = self.system_libs.map(@(sl) { return sl.to_dict() })
+    }
+    if self.package_dependencies {
+      out['package_dependencies'] = self.package_dependencies.to_dict()
+    }
+    if self.generators.length() > 0 {
+      out['generators'] = self.generators.map(@(g) { return g.to_dict() })
+    }
+    if self.test_config { out['test_config'] = self.test_config.to_dict() }
+    if self.install     { out['install']     = self.install.to_dict() }
+
+    return out
+  }
+}

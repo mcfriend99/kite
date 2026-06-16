@@ -1,0 +1,402 @@
+/**
+ * kite/toolchain.zu
+ *
+ * Toolchain  —  locates compilers, linkers, archivers, and pkg-config;
+ *               builds the exact command-line invocations for each
+ *               compilation and link step.
+ *
+ * Responsibilities:
+ *   - Resolve the compiler/linker binary paths for a BuildPlan
+ *   - Assemble per-file compile commands
+ *   - Assemble per-target link / archive commands
+ *   - Resolve SystemLib entries (pkg-config → fallback)
+ *   - Emit compile_commands.json entries for IDE integration
+ */
+
+import os
+import json
+import .utils {
+  find_app_in_path, find_compiler, run_pkg_config,
+  shell_quote, build_command,
+  log_info, log_warn, log_error, log_step,
+  is_windows, is_macos, is_linux
+}
+import .utils { is_windows }
+import .intent.target { TargetType }
+
+# ── CompileCommand ────────────────────────────────────────────────────────────
+
+/**
+ * Everything needed to compile one source file to an object file.
+ */
+class CompileCommand {
+  var compiler    = ''   # full path to compiler binary
+  var source      = ''   # input .c / .cpp file (absolute)
+  var object      = ''   # output .o / .obj file (absolute)
+  var flags       = []   # all flags including -I, -D, -std, profile opts
+  var is_cxx      = false
+
+  CompileCommand() {}
+
+  /** The full argv list (compiler + flags + -c -o object source). */
+  argv() {
+    var args = [self.compiler]
+    args.extend(self.flags)
+    if is_windows {
+      args.extend(['/c', '/Fo${self.object}', self.source])
+    } else {
+      args.extend(['-c', '-o', self.object, self.source])
+    }
+    return args
+  }
+
+  cmd_string() { return build_command(self.argv()) }
+
+  /** compile_commands.json entry for clangd / other LSPs. */
+  to_compile_commands_entry(base_dir) {
+    return {
+      'directory': base_dir,
+      'file':      self.source,
+      'arguments': self.argv(),
+    }
+  }
+}
+
+# ── LinkCommand ───────────────────────────────────────────────────────────────
+
+/**
+ * Everything needed to link / archive one target.
+ */
+class LinkCommand {
+  var linker      = ''    # full path to linker / compiler-driver / ar
+  var output      = ''    # output file path
+  var objects     = []    # .o files to link
+  var flags       = []    # -L, -l, -shared, profile link opts, etc.
+  var target_type = ''    # TargetType constant
+  var is_archive  = false # true → use ar / lib.exe instead of linker
+
+  LinkCommand() {}
+
+  argv() {
+    if self.is_archive {
+      # ar rcs output.a obj1.o obj2.o  (POSIX)
+      # lib.exe /OUT:output.lib obj1.obj obj2.obj  (MSVC)
+      if is_windows {
+        var args = [self.linker, '/OUT:${self.output}']
+        args.extend(self.objects)
+        return args
+      }
+      var args = [self.linker, 'rcs', self.output]
+      args.extend(self.objects)
+      return args
+    }
+
+    var args = [self.linker]
+    args.extend(self.objects)
+    if is_windows {
+      args.append('/OUT:${self.output}')
+    } else {
+      args.extend(['-o', self.output])
+    }
+    args.extend(self.flags)
+    return args
+  }
+
+  cmd_string() { return build_command(self.argv()) }
+}
+
+# ── Toolchain ─────────────────────────────────────────────────────────────────
+
+class Toolchain {
+
+  var _ctx      = nil   # PlatformContext
+  var _cache    = {}    # binary name → resolved path cache
+  var _syslib_cache = {}  # pkg_config spec → {cflags, libs}
+
+  Toolchain(ctx) {
+    self._ctx = ctx
+  }
+
+  # ── Binary resolution ──────────────────────────────────────────────────
+
+  /**
+   * Resolve a compiler name ("gcc", "clang", "cl", "cc") to a full path.
+   * Caches results.
+   */
+  resolve_compiler(name) {
+    if self._cache.contains(name) { return self._cache[name] }
+
+    var path = find_compiler(name)
+    if !path {
+      log_error('Cannot find compiler: ${name}')
+      raise Exception('kite: compiler "${name}" not found in PATH')
+    }
+
+    log_info('Compiler: ${name} → ${path}')
+    self._cache[name] = path
+    return path
+  }
+
+  /**
+   * Resolve a linker name to a full path.
+   * For most GCC/Clang builds the compiler driver is used as linker.
+   */
+  resolve_linker(name, compiler_path) {
+    if self._cache.contains('linker:${name}') {
+      return self._cache['linker:${name}']
+    }
+
+    # Special names that are not the compiler driver
+    var special = ['ld', 'lld', 'gold', 'link', 'mold']
+    if special.contains(name) {
+      if find_app_in_path(name) {
+        self._cache['linker:${name}'] = compiler_path
+        return compiler_path
+      }
+
+      # Fall through to using the compiler driver
+      log_warn('Linker "${name}" not found, falling back to compiler driver')
+    }
+
+    # Default: use the compiler driver as the linker (correct for most cases)
+    self._cache['linker:${name}'] = compiler_path
+    return compiler_path
+  }
+
+  /**
+   * Resolve the archiver (ar / lib.exe) for static libraries.
+   */
+  resolve_archiver() {
+    if self._cache.contains('archiver') { return self._cache['archiver'] }
+
+    var name = is_windows ? 'lib.exe' : 'ar'
+    var path = find_app_in_path(name)
+    if !path {
+      log_warn('Archiver "${name}" not found; static library builds may fail')
+    }
+    self._cache['archiver'] = path ? path : name
+    return self._cache['archiver']
+  }
+
+  # ── SystemLib resolution ───────────────────────────────────────────────
+
+  /**
+   * Resolve a SystemLib entry.
+   * Tries pkg-config first; falls back to the manual fallback block.
+   * Returns {cflags: [], libs: []} or nil on total failure.
+   */
+  resolve_system_lib(system_lib) {
+    var spec = system_lib.lib_name()
+    var constraint = system_lib.version_constraint()
+    var pkg_spec = constraint ? '${spec} ${constraint}' : spec
+
+    if self._syslib_cache.contains(pkg_spec) {
+      return self._syslib_cache[pkg_spec]
+    }
+
+    var result = run_pkg_config(pkg_spec)
+    if result {
+      log_info('pkg-config: ${pkg_spec} → cflags=${result["cflags"]} libs=${result["libs"]}')
+      self._syslib_cache[pkg_spec] = result
+      return result
+    }
+
+    # pkg-config failed — try fallback
+    if system_lib.fallback {
+      var fb = system_lib.fallback
+      var cflags = fb.includes ? fb.includes.resolve(self._ctx) : []
+      var libs   = fb.link_options ? fb.link_options.resolve(self._ctx) : []
+
+      # Convert include paths to -I flags
+      var inc_flags = cflags.map(@(p) {
+        return p.starts_with('-I') ? p : '-I${p}'
+      })
+
+      var r = { 'cflags': inc_flags, 'libs': libs }
+      log_warn('pkg-config: ${pkg_spec} not found, using fallback')
+      self._syslib_cache[pkg_spec] = r
+      return r
+    }
+
+    log_error('Cannot resolve system library: ${pkg_spec}')
+    return { 'cflags': [], 'libs': [] }
+  }
+
+  /**
+   * Resolve all system_libs for a BuildPlan.
+   * Returns {cflags: [], libs: []} merged across all entries.
+   */
+  resolve_all_system_libs(plan) {
+    var all_cflags = []
+    var all_libs   = []
+    for sl in plan.system_libs {
+      var r = self.resolve_system_lib(sl)
+      if r {
+        all_cflags.extend(r['cflags'])
+        all_libs.extend(r['libs'])
+      }
+    }
+    return { 'cflags': all_cflags, 'libs': all_libs }
+  }
+
+  # ── Command assembly ───────────────────────────────────────────────────
+
+  /**
+   * Build a CompileCommand for one source file.
+   *
+   * @param plan      BuildPlan
+   * @param src       absolute source file path
+   * @param obj       absolute object file path
+   * @param obj_dir   directory for object files
+   */
+  make_compile_command(plan, src, obj) {
+    var compiler_name = plan.compiler
+    var compiler_path = self.resolve_compiler(compiler_name)
+    var is_msvc       = compiler_name == 'msvc' or compiler_name == 'cl'
+    var is_cxx        = src.ends_with('.cpp') or src.ends_with('.cc') or
+                        src.ends_with('.cxx') or src.ends_with('.c++')
+
+    # If source is C++ but compiler is a C compiler, swap to c++ driver
+    var actual_compiler = compiler_path
+    if is_cxx and !is_msvc {
+      var cxx_name = compiler_name == 'gcc' ? 'g++' :
+                     compiler_name == 'cc'  ? 'c++' :
+                     compiler_name + '++'
+      actual_compiler = self.resolve_compiler(cxx_name)
+    }
+
+    # Base flags from plan
+    var flags = []
+    flags.extend(plan.compile_flags)
+
+    # System lib cflags (include paths)
+    var syslibs = self.resolve_all_system_libs(plan)
+    flags.extend(syslibs['cflags'])
+
+    # Per-file overrides (replace base flags for this file only)
+    if plan.file_overrides.contains(src) {
+      var override_flags = plan.file_overrides[src].get('compile_flags', [])
+      # Append overrides after base flags; the compiler applies last wins
+      flags.extend(override_flags)
+    }
+
+    # Include paths not already in compile_flags
+    for inc in plan.include_paths {
+      var flag = is_msvc ? '/I${inc}' : '-I${inc}'
+      if !flags.contains(flag) { flags.append(flag) }
+    }
+
+    var cc = CompileCommand()
+    cc.compiler = actual_compiler
+    cc.source   = src
+    cc.object   = obj
+    cc.flags    = flags
+    cc.is_cxx   = is_cxx
+    return cc
+  }
+
+  /**
+   * Build a LinkCommand for a target.
+   *
+   * @param plan          BuildPlan
+   * @param objects       list of absolute .o paths
+   * @param dep_artifacts list of {path, type} for link_targets artifacts
+   */
+  make_link_command(plan, objects, dep_artifacts) {
+    var compiler_name = plan.compiler
+    var compiler_path = self.resolve_compiler(compiler_name)
+    var linker_name   = plan.linker
+    var is_msvc       = compiler_name == 'msvc' or compiler_name == 'cl'
+
+    var is_static = plan.target_type == TargetType.STATIC_LIB
+    var is_shared = plan.target_type == TargetType.SHARED_LIB or
+                    plan.target_type == TargetType.ZURI_MODULE
+
+    var lc = LinkCommand()
+    lc.output      = plan.output_path
+    lc.objects     = objects
+    lc.target_type = plan.target_type
+    lc.is_archive  = is_static
+
+    if is_static {
+      lc.linker = self.resolve_archiver()
+      lc.flags  = []
+      return lc
+    }
+
+    lc.linker = self.resolve_linker(linker_name, compiler_path)
+
+    var flags = []
+
+    # Tell the compiler driver which low-level linker backend to use.
+    # 'ld' is the default so no flag needed; others must be explicit.
+    var non_default = ['lld', 'gold', 'mold']
+    if non_default.contains(linker_name) {
+      if find_app_in_path(linker_name) {
+        flags.append('-fuse-ld=${linker_name}')
+      } else {
+        log_warn('Linker "${linker_name}" not found, falling back to default ld')
+      }
+    }
+
+    # Shared library flag
+    if is_shared {
+      flags.append(is_msvc ? '/DLL' : '-shared')
+      if is_macos and !is_msvc {
+        flags.append('-install_name')
+        flags.append('@rpath/${os.base_name(plan.output_path)}')
+      }
+    }
+
+    # Link against dependency artifacts
+    for dep in dep_artifacts {
+      if dep['type'] == TargetType.STATIC_LIB {
+        flags.append(dep['path'])
+      } else if dep['type'] == TargetType.SHARED_LIB or
+                dep['type'] == TargetType.ZURI_MODULE {
+        if is_msvc {
+          var implib = dep['path'].replace('.dll', '.lib')
+          flags.append(implib)
+        } else {
+          var dir    = os.dir_name(dep['path'])
+          var base   = os.base_name(dep['path'])
+          # Strip lib prefix and extension → -lname
+          base = base.replace('.so', '').replace('.dylib', '')
+          if base.starts_with('lib') { base = base[3,] }
+          flags.append('-L${dir}')
+          flags.append('-l${base}')
+        }
+      }
+    }
+
+    # Plan link flags (-lm, -lpthread, -fsanitize=…, etc.)
+    flags.extend(plan.link_flags)
+
+    # System library link flags
+    var syslibs = self.resolve_all_system_libs(plan)
+    flags.extend(syslibs['libs'])
+
+    # rpath for shared libs on Linux
+    if is_linux and is_shared {
+      flags.extend(['-Wl,-rpath,$ORIGIN', '-Wl,-soname,${os.base_name(plan.output_path)}'])
+    }
+
+    lc.flags = flags
+    return lc
+  }
+
+  # ── compile_commands.json ─────────────────────────────────────────────
+
+  /**
+   * Write a compile_commands.json to the project root.
+   * Accepts a list of CompileCommand objects.
+   */
+  static write_compile_commands(commands, base_dir, out_path) {
+    var entries = commands.map(@(cc) {
+      return cc.to_compile_commands_entry(base_dir)
+    })
+    var content = json.encode(entries)
+    file(out_path, 'w').write(content)
+    log_info('compile_commands.json → ${out_path}')
+  }
+}

@@ -1,0 +1,32 @@
+/**
+ * kite/intent/index.zu  —  Public API surface of the kite config model.
+ *
+ * Import this file to get everything:
+ *
+ * ```zuri
+ * import kite
+ *
+ * var project = kite.Project.from_raw(yaml.parse(read_file('kite.yaml')))
+ * var ctx     = kite.PlatformContext.detect()
+ * var plans   = project.resolve(ctx, 'release', nil)
+ *
+ * for plan in plans {
+ *   echo '${plan.target_name} → ${plan.output_path}'
+ *   echo '  compiler : ${plan.compiler}'
+ *   echo '  flags    : ${" ".join(plan.compile_flags)}'
+ * }
+ * ```
+ */
+
+import .platform { PlatformContext, PlatformMap }
+import .types    { Version, VersionRequirement,
+                   LanguageStandard, OutputName, EnvVar }
+import .sources  { SourceSet, IncludeSet, DefineSet,
+                   FileOptions, GeneratorStep, FetchStep,
+                   SystemLib, SystemLibFallback, PackageDeps }
+import .build    { BuildProfile, ProfileResolver,
+                   ProjectDefaults, BuildHooks,
+                   InstallManifest, InstallFile,
+                   WorkspaceConfig, TestConfig }
+import .target   { TargetType, Target }
+import .project  { DependencyGraph, BuildPlan, Project }

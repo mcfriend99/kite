@@ -1,0 +1,22 @@
+# zuri packages directory and files
+.zuri/
+*.nyp
+
+# popular editors
+.vscode/
+.idea/
+.vs/
+
+# c object files (for C extensions)
+*.o
+*.ko
+*.obj
+*.elf
+
+# log files
+*.log
+
+
+dist/
+.kite/
+compile_commands.json

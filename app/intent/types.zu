@@ -1,0 +1,314 @@
+/**
+ * kite/intent/types.zu
+ *
+ * Primitive value-object types used throughout the kite config model.
+ * Each class is immutable after construction and validates its input.
+ */
+
+import .platform { PlatformMap }
+
+# ── Version ──────────────────────────────────────────────────────────────────
+
+/**
+ * Semantic version: major.minor.patch
+ *
+ *   var v = Version('1.2.3')
+ *   v.major   # 1
+ *   v.satisfies('>=1.0.0')  # true
+ */
+class Version {
+
+  var major = 0
+  var minor = 0
+  var patch = 0
+  var _raw  = ''
+
+  Version(raw) {
+    self._raw = raw
+    var parts = raw.split('.')
+    self.major = parts.length() > 0 ? to_number(parts[0]) : 0
+    self.minor = parts.length() > 1 ? to_number(parts[1]) : 0
+    self.patch = parts.length() > 2 ? to_number(parts[2]) : 0
+  }
+
+  /** Compare against a constraint string: ">=1.0.0", "^2.1", "~0.9.0" */
+  satisfies(constraint) {
+    constraint = constraint.trim()
+
+    if constraint.starts_with('>=') {
+      var other = Version(constraint[2,])
+      return self._cmp(other) >= 0
+    }
+    if constraint.starts_with('<=') {
+      var other = Version(constraint[2,])
+      return self._cmp(other) <= 0
+    }
+    if constraint.starts_with('>') {
+      var other = Version(constraint[1,])
+      return self._cmp(other) > 0
+    }
+    if constraint.starts_with('<') {
+      var other = Version(constraint[1,])
+      return self._cmp(other) < 0
+    }
+    if constraint.starts_with('^') {
+      # Compatible release: same major, >= minor.patch
+      var other = Version(constraint[1,])
+      return self.major == other.major and self._cmp(other) >= 0
+    }
+    if constraint.starts_with('~') {
+      # Patch-level: same major.minor, >= patch
+      var other = Version(constraint[1,])
+      return self.major == other.major and
+             self.minor == other.minor  and
+             self._cmp(other) >= 0
+    }
+    # Exact match
+    var other = Version(constraint)
+    return self._cmp(other) == 0
+  }
+
+  _cmp(other) {
+    if self.major != other.major { return self.major - other.major }
+    if self.minor != other.minor { return self.minor - other.minor }
+    return self.patch - other.patch
+  }
+
+  to_string() { return self._raw }
+
+  @to_string() {
+    return self.to_string()
+  }
+}
+
+# ── VersionRequirement ───────────────────────────────────────────────────────
+
+/**
+ * Represents the `requires:` block at the project root.
+ *
+ *   requires:
+ *     kite:  ">=1.0.0"
+ *     zuri:  ">=0.9.0"
+ */
+class VersionRequirement {
+
+  var kite = nil    # constraint string or nil
+  var zuri = nil
+
+  VersionRequirement() {}
+
+  static from_raw(raw) {
+    if !raw { return VersionRequirement() }
+    var vr = VersionRequirement()
+    vr.kite = raw.get('kite', nil)
+    vr.zuri = raw.get('zuri', nil)
+    return vr
+  }
+
+  /** Check both constraints against actual versions; return list of errors. */
+  validate(kite_version, zuri_version) {
+    var errors = []
+    if self.kite and kite_version {
+      if !Version(kite_version).satisfies(self.kite) {
+        errors.append('kite ${kite_version} does not satisfy required ${self.kite}')
+      }
+    }
+    if self.zuri and zuri_version {
+      if !Version(zuri_version).satisfies(self.zuri) {
+        errors.append('zuri ${zuri_version} does not satisfy required ${self.zuri}')
+      }
+    }
+    return errors
+  }
+
+  to_dict() {
+    return {
+      kite: self.kite,
+      zuri: self.zuri
+    }.compact()
+
+    # var out = {}
+    # if self.kite { out['kite'] = self.kite }
+    # if self.zuri { out['zuri'] = self.zuri }
+    # return out
+  }
+}
+
+# ── LanguageStandard ─────────────────────────────────────────────────────────
+
+var _VALID_C   = ['c89', 'c90', 'c99', 'c11', 'c17', 'c18', 'c23']
+var _VALID_CXX = ['c++98', 'c++03', 'c++11', 'c++14',
+                  'c++17', 'c++20', 'c++23']
+
+/**
+ * `std:` block — C and C++ language standards.
+ * kite translates these to the correct compiler flags automatically
+ * (-std=c11 for GCC/Clang, /std:c11 for MSVC).
+ *
+ *   std:
+ *     c:   c11
+ *     cxx: c++17
+ */
+class LanguageStandard {
+
+  var c   = nil   # 'c89' | 'c99' | 'c11' | 'c17' | 'c23' | nil
+  var cxx = nil   # 'c++11' | 'c++14' | 'c++17' | 'c++20' | 'c++23' | nil
+
+  LanguageStandard() {}
+
+  static from_raw(raw) {
+    if !raw { return nil }
+    var ls = LanguageStandard()
+
+    if is_dict(raw) {
+      ls.c   = raw.get('c',   nil)
+      ls.cxx = raw.get('cxx', nil)
+    } else if is_string(raw) {
+      if _VALID_C.contains(raw) {
+        ls.c = raw
+      } else if _VALID_CXX.contains(raw) {
+        ls.cxx = raw
+      }
+    } else {
+      raise Exception('Invalid std: "${raw}". Expected dict or string.')
+    }
+
+    ls.validate()
+    return ls
+  }
+
+  validate() {
+    if self.c and !_VALID_C.contains(self.c) {
+      raise Exception('Invalid C standard: "${self.c}". Valid: ${_VALID_C}')
+    }
+    if self.cxx and !_VALID_CXX.contains(self.cxx) {
+      raise Exception('Invalid C++ standard: "${self.cxx}". Valid: ${_VALID_CXX}')
+    }
+  }
+
+  /**
+   * Emit the correct compiler flag for the given compiler string.
+   * Returns a list (may be empty if no standard was specified).
+   */
+  to_flags(compiler) {
+    var flags = []
+    if compiler == 'msvc' or compiler == 'cl' {
+      if self.c   { flags.append('/std:${self.c}') }
+      if self.cxx { flags.append('/std:${self.cxx}') }
+    } else {
+      if self.c   { flags.append('-std=${self.c}') }
+      if self.cxx { flags.append('-std=${self.cxx}') }
+    }
+    return flags
+  }
+
+  to_dict() {
+    return {
+      c: self.c,
+      cxx: self.cxx
+    }.compact()
+
+    # var out = {}
+    # if self.c   { out['c']   = self.c }
+    # if self.cxx { out['cxx'] = self.cxx }
+    # return out
+  }
+}
+
+# ── OutputName ───────────────────────────────────────────────────────────────
+
+/**
+ * `output_name:` block — platform-specific binary name.
+ *
+ *   output_name:
+ *     "*":     coroutine
+ *     windows: coroutine_win
+ */
+class OutputName {
+
+  var p_map = nil
+
+  OutputName(map) {
+    self.p_map = map
+  }
+
+  static from_raw(raw) {
+    if !raw { return nil }
+    if is_string(raw) {
+      var pm = PlatformMap()
+      pm.set('*', raw)
+      return OutputName(pm)
+    }
+    return OutputName(PlatformMap.from_raw(raw))
+  }
+
+  resolve(ctx) {
+    return self.p_map.resolve_one(ctx)
+  }
+
+  to_dict() { return self.p_map.to_dict() }
+}
+
+# ── EnvVar ───────────────────────────────────────────────────────────────────
+
+/**
+ * A single entry under `env:`.
+ *
+ *   env:
+ *     ZURI_ROOT:
+ *       required:    true
+ *       description: "Path to Zuri installation"
+ *     OPENSSL_ROOT:
+ *       required: false
+ *       default:  /usr/local
+ */
+class EnvVar {
+
+  var name        = ''
+  var required    = false
+  var description = ''
+  var default_val = nil
+
+  EnvVar(name) {
+    self.name = name
+  }
+
+  static from_raw(name, raw) {
+    var ev = EnvVar(name)
+    if is_dict(raw) {
+      ev.required    = raw.get('required',    false)
+      ev.description = raw.get('description', '')
+      ev.default_val = raw.get('default',     nil)
+    } else {
+      # bare boolean shorthand: ZURI_ROOT: true
+      ev.required = raw == true
+    }
+    return ev
+  }
+
+  /**
+   * Validate against the real environment.
+   * Returns an error string or nil if satisfied.
+   */
+  validate(env_dict) {
+    if env_dict == nil {
+      env_dict = {}
+    }
+    
+    var val = env_dict.get(self.name, nil)
+    if val == nil and self.default_val != nil { return nil }
+    if val == nil and self.required {
+      return 'Required environment variable "${self.name}" is not set.' +
+              (self.description ? ' ' + self.description : '')
+    }
+    return nil
+  }
+
+  to_dict() {
+    return {
+      'required':    self.required,
+      'description': self.description,
+      'default':     self.default_val,
+    }
+  }
+}

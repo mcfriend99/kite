@@ -1,0 +1,439 @@
+/**
+ * kite/intent/project.zu
+ *
+ * Project  —  the root of the kite configuration model.
+ *
+ * Responsibilities:
+ *   1. Parse and validate the full kite.yaml into a typed object graph.
+ *   2. Resolve target `inherits` chains.
+ *   3. Topologically sort targets by `link_targets` for correct build order.
+ *   4. Propagate public include paths from library targets to their consumers.
+ *   5. Validate environment variables and version requirements.
+ *   6. Provide a single `resolve(ctx, profile_name)` entry-point for the
+ *      build driver that returns a fully-materialised build plan.
+ */
+
+import .platform { PlatformContext, PlatformMap }
+import .types    { Version, VersionRequirement, EnvVar }
+import .build    { BuildProfile, ProfileResolver,
+                   ProjectDefaults, BuildHooks,
+                   InstallManifest, WorkspaceConfig }
+import .target   { Target, TargetType }
+
+# ── DependencyGraph ───────────────────────────────────────────────────────────
+
+/**
+ * Builds a directed acyclic graph of target → link_targets dependencies
+ * and exposes a topological sort for build ordering.
+ */
+class DependencyGraph {
+
+  var _targets = {}   # name → Target
+
+  DependencyGraph(targets) {
+    self._targets = targets
+  }
+
+  /**
+   * Kahn's algorithm topological sort.
+   * Returns an ordered list of target names (dependencies first).
+   * Raises on cycles.
+   */
+  topo_sort() {
+    # Build in-degree map
+    var in_degree = {}
+    var adj       = {}
+
+    for name, _ in self._targets {
+      in_degree[name] = 0
+      adj[name]       = []
+    }
+
+    for name, target in self._targets {
+      for dep in target.link_targets {
+        if !self._targets.contains(dep) {
+          raise Exception('kite: target "${name}" links unknown target "${dep}"')
+        }
+        adj[dep].append(name)   # dep must be built before name
+        in_degree[name]++
+      }
+    }
+
+    # Collect zero in-degree nodes
+    var queue = []
+    for name, deg in in_degree {
+      if deg == 0 { queue.append(name) }
+    }
+    queue.sort()   # deterministic order for independent targets
+
+    var order = []
+    while queue.length() > 0 {
+      var node = queue[0]
+      queue = queue[1,]
+      order.append(node)
+
+      for dependent in adj[node] {
+        in_degree[dependent]--
+        if in_degree[dependent] == 0 {
+          queue.append(dependent)
+          queue.sort()
+        }
+      }
+    }
+
+    if order.length() != self._targets.length() {
+      raise Exception('kite: circular dependency detected among targets')
+    }
+
+    return order
+  }
+
+  /**
+   * Collect all transitive public include paths that `target_name`
+   * inherits from its link_targets (recursively).
+   */
+  transitive_public_includes(target_name, ctx) {
+    var seen    = []
+    var results = []
+    self._collect_includes(target_name, ctx, seen, results)
+    return results
+  }
+
+  _collect_includes(name, ctx, seen, results) {
+    if seen.contains(name) { return }
+    seen.append(name)
+
+    var target = self._targets.get(name, nil)
+    if !target { return }
+
+    for dep_name in target.link_targets {
+      var dep = self._targets.get(dep_name, nil)
+      if dep and dep.includes {
+        results.extend(dep.includes.resolve_public(ctx))
+      }
+      self._collect_includes(dep_name, ctx, seen, results)
+    }
+  }
+}
+
+# ── BuildPlan ─────────────────────────────────────────────────────────────────
+
+/**
+ * Immutable snapshot of everything the build driver needs to compile
+ * one target in a specific platform context + profile.
+ *
+ * The build driver (kite's C/Zuri engine) consumes BuildPlan objects;
+ * it never reads raw config fields directly.
+ */
+class BuildPlan {
+
+  var target_name    = ''
+  var target_type    = ''
+  var output_name    = ''
+  var output_path    = ''   # output_dir/output_name + extension
+
+  var compiler       = ''
+  var linker         = ''
+
+  var source_patterns  = []   # glob patterns to expand
+  var source_excludes  = []
+  var include_paths    = []   # -I paths (own + transitive public)
+  var compile_flags    = []   # fully assembled
+  var link_flags       = []   # fully assembled
+  var link_targets     = []   # sibling target names (for build ordering)
+
+  var generators       = []   # GeneratorStep list
+  var file_overrides   = {}   # path → {compile_flags: []}
+  var system_libs      = []   # SystemLib list
+  var package_deps     = nil  # PackageDeps or nil
+
+  var test_config      = nil  # TestConfig or nil (type=test only)
+  var install          = nil  # InstallManifest or nil
+
+  BuildPlan() {}
+
+  to_dict() {
+    return {
+      'target_name':    self.target_name,
+      'target_type':    self.target_type,
+      'output_name':    self.output_name,
+      'output_path':    self.output_path,
+      'compiler':       self.compiler,
+      'linker':         self.linker,
+      'source_patterns': self.source_patterns,
+      'source_excludes': self.source_excludes,
+      'include_paths':  self.include_paths,
+      'compile_flags':  self.compile_flags,
+      'link_flags':     self.link_flags,
+      'link_targets':   self.link_targets,
+    }
+  }
+}
+
+# ── Project ───────────────────────────────────────────────────────────────────
+
+class Project {
+
+  var name        = ''
+  var version     = nil   # Version
+  var description = ''
+  var license     = ''
+  var authors     = []
+
+  var requires    = nil   # VersionRequirement
+  var defaults    = nil   # ProjectDefaults
+  var profiles    = {}    # name → BuildProfile
+  var targets     = {}    # name → Target  (raw, pre-inheritance-resolution)
+  var hooks       = nil   # BuildHooks
+  var workspace   = nil   # WorkspaceConfig or nil
+  var install     = nil   # InstallManifest (project-level default)
+  var env         = {}    # name → EnvVar
+
+  var resolved_targets = {}   # name → Target (post-inheritance-resolution)
+  var graph            = nil  # DependencyGraph
+
+  Project() {}
+
+  # ── Parsing ────────────────────────────────────────────────────────────
+
+  /**
+   * Primary entry-point: construct a Project from a parsed YAML dict.
+   * Typically called as:  Project.from_raw(yaml.parse(file_contents))
+   */
+  static from_raw(raw) {
+    if !raw { raise Exception('kite: empty project file') }
+
+    var p           = self()
+    p.name          = raw.get('name',        'unnamed')
+    p.version       = raw.contains('version') ? Version(to_string(raw['version'])) : nil
+    p.description   = raw.get('description', '')
+    p.license       = raw.get('license',     '')
+    p.authors       = raw.get('authors',     [])
+
+    p.requires  = VersionRequirement.from_raw(raw.get('requires',  nil))
+    p.defaults  = ProjectDefaults.from_raw(raw.get('defaults',     nil))
+    p.profiles  = BuildProfile.map_from_raw(raw.get('profiles',    nil))
+    p.targets   = Target.map_from_raw(raw.get('targets',           nil))
+    p.hooks     = BuildHooks.from_raw(raw.get('hooks',             nil))
+    p.workspace = WorkspaceConfig.from_raw(raw.get('workspace',    nil))
+    p.install   = InstallManifest.from_raw(raw.get('install',      nil))
+
+    if raw.contains('env') {
+      for name, spec in raw['env'] {
+        p.env[name] = EnvVar.from_raw(name, spec)
+      }
+    }
+
+    p.resolve_inheritance()
+    p.graph = DependencyGraph(p.resolved_targets)
+
+    return p
+  }
+
+  # ── Inheritance resolution ─────────────────────────────────────────────
+
+  resolve_inheritance() {
+    for name, target in self.targets {
+      self.resolved_targets[name] = self.resolve_target(name, [])
+    }
+  }
+
+  resolve_target(name, chain) {
+    if chain.contains(name) {
+      raise Exception('kite: circular target inheritance: ${" -> ".join(chain)} -> ${name}')
+    }
+    if self.resolved_targets.contains(name) {
+      return self.resolved_targets[name]
+    }
+
+    var target = self.targets.get(name, nil)
+    if !target { raise Exception('kite: unknown target "${name}"') }
+
+    if !target.inherits { return target }
+
+    chain.append(name)
+    var root = self._resolve_target(target.inherits, chain)
+    return target.resolved_with(root)
+  }
+
+  # ── Validation ────────────────────────────────────────────────────────
+
+  /**
+   * Validate version requirements, environment variables, and target graph.
+   * Returns a list of error strings; empty means valid.
+   */
+  validate(kite_version, zuri_version, env_dict) {
+    var errors = []
+
+    # Version constraints
+    if self.requires {
+      errors.extend(self.requires.validate(kite_version, zuri_version))
+    }
+
+    # Environment variables
+    for name, ev in self.env {
+      var err = ev.validate(env_dict)
+      if err { errors.append(err) }
+    }
+
+    # Validate link_targets reference real targets
+    for name, target in self.resolved_targets {
+      for dep in target.link_targets {
+        if !self.resolved_targets.contains(dep) {
+          errors.append('target "${name}": link_targets references unknown target "${dep}"')
+        }
+      }
+    }
+
+    return errors
+  }
+
+  # ── Build plan production ─────────────────────────────────────────────
+
+  /**
+   * Produce an ordered list of BuildPlan objects for all targets
+   * (or a specific subset) in dependency-correct build order.
+   *
+   * @param ctx          PlatformContext
+   * @param profile_name string or nil (nil = no profile)
+   * @param only         list of target names or nil (nil = all)
+   */
+  resolve(ctx, profile_name, only) {
+    var profile = nil
+    if profile_name {
+      var resolver = ProfileResolver(self.profiles)
+      profile = resolver.resolve(profile_name)
+    }
+
+    var order = self.graph.topo_sort()
+    if only {
+      order = order.filter(@(n) { return only.contains(n) })
+    }
+
+    var plans = []
+    for name in order {
+      plans.append(self._make_plan(name, ctx, profile))
+    }
+
+    return plans
+  }
+
+  _make_plan(name, ctx, profile) {
+    var target   = self.resolved_targets[name]
+    var compiler = target.effective_compiler(ctx, self.defaults)
+    var linker   = target.effective_linker(ctx, self.defaults)
+    var out_name = target.effective_output_name(ctx)
+    var out_dir  = target.effective_output_dir(self.defaults)
+    var ext      = TargetType.extension(target.type, ctx.os)
+
+    # Set effective target defaults
+    target.set_defaults(self.defaults)
+    
+    var plan = BuildPlan()
+    plan.target_name  = name
+    plan.target_type  = target.type
+    plan.output_name  = out_name
+    plan.output_path  = '${out_dir}/${out_name}${ext}'
+    plan.compiler     = compiler
+    plan.linker       = linker
+    plan.link_targets = target.link_targets
+    plan.system_libs  = target.system_libs
+    plan.package_deps = target.package_dependencies
+    plan.test_config  = target.test_config
+    plan.install      = target.install ? target.install : self.install
+    plan.generators   = target.generators
+
+    # Source patterns + excludes
+    if target.sources {
+      plan.source_patterns = target.sources.patterns(ctx)
+      plan.source_excludes = target.sources.excludes()
+    }
+
+    # Include paths: own paths + transitive public paths from link_targets
+    var inc_paths = []
+    if target.includes {
+      inc_paths.extend(target.includes.resolve_all(ctx))
+    }
+    inc_paths.extend(self.graph.transitive_public_includes(name, ctx))
+    plan.include_paths = inc_paths
+
+    # Compile flags
+    plan.compile_flags = target.all_compile_flags(ctx, compiler, profile)
+
+    # Link flags
+    plan.link_flags = target.all_link_flags(ctx, compiler, profile)
+
+    # Per-file overrides
+    if target.file_options {
+      for path, entry in target.file_options.overrides  {
+        var file_flags = []
+        if entry.contains('compile_options') {
+          file_flags.extend(entry['compile_options'].resolve(ctx))
+        }
+        if entry.contains('defines') {
+          file_flags.extend(entry['defines'].to_flags(ctx, compiler))
+        }
+        plan.file_overrides[path] = { 'compile_flags': file_flags }
+      }
+    }
+
+    return plan
+  }
+
+  # ── Convenience accessors ─────────────────────────────────────────────
+
+  /** Return build-order-sorted list of target names. */
+  build_order() {
+    return self.graph.topo_sort()
+  }
+
+  /** Return only test targets. */
+  test_targets() {
+    var out = {}
+    for name, t in self.resolved_targets {
+      if t.type == TargetType.TEST { out[name] = t }
+    }
+    return out
+  }
+
+  /** Return only installable targets. */
+  installable_targets() {
+    var out = {}
+    for name, t in self.resolved_targets {
+      if t.install or self.install { out[name] = t }
+    }
+    return out
+  }
+
+  to_dict() {
+    var out = {
+      'name':        self.name,
+      'description': self.description,
+      'license':     self.license,
+      'authors':     self.authors,
+    }
+    if self.version   { out['version']   = self.version.to_string() }
+    if self.requires  { out['requires']  = self.requires.to_dict() }
+    if self.defaults  { out['defaults']  = self.defaults.to_dict() }
+    if self.workspace { out['workspace'] = self.workspace.to_dict() }
+    if self.hooks     { out['hooks']     = self.hooks.to_dict() }
+    if self.install   { out['install']   = self.install.to_dict() }
+
+    out['profiles'] = {}
+    for name, p in self.profiles {
+      out['profiles'][name] = p.to_dict()
+    }
+
+    out['targets'] = {}
+    for name, t in self.targets {
+      out['targets'][name] = t.to_dict()
+    }
+
+    out['env'] = {}
+    for name, ev in self.env {
+      out['env'][name] = ev.to_dict()
+    }
+
+    return out
+  }
+}

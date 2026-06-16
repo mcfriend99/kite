@@ -1,0 +1,436 @@
+/**
+ * kite/intent/build.zu
+ *
+ * Build-configuration classes that operate above the target level:
+ *   BuildProfile   — named build variant (debug / release / asan / …)
+ *   ProjectDefaults — inherited baseline for all targets
+ *   BuildHooks     — pre/post lifecycle scripts
+ *   InstallManifest — what `kite install` copies and where
+ *   WorkspaceConfig — monorepo member list
+ *   TestConfig     — test target runner settings
+ */
+
+import .platform { PlatformMap }
+import .sources  { DefineSet }
+import .types { LanguageStandard }
+
+# ── BuildProfile ─────────────────────────────────────────────────────────────
+
+/**
+ * A named build profile invoked with `kite build --profile <name>`.
+ *
+ *   profiles:
+ *     debug:
+ *       defines:
+ *         "*": [DEBUG=1, ASSERTIONS=1]
+ *       compile_options:
+ *         unix:    [-O0, -g3, -fno-omit-frame-pointer]
+ *         windows: [/Od, /Zi]
+ *
+ *     asan:
+ *       inherits: debug             # merges on top of debug; does not replace
+ *       compile_options:
+ *         unix: [-fsanitize=address,undefined]
+ *       link_options:
+ *         unix: [-fsanitize=address,undefined]
+ *
+ * Merge semantics:
+ *   - List fields (compile_options, link_options, defines) are appended.
+ *   - Scalar fields (std, compiler, linker) are overridden.
+ *   - `inherits` is resolved before user overrides are applied.
+ */
+class BuildProfile {
+
+  var name            = ''
+  var inherits        = nil   # parent profile name (string) or nil
+
+  var compile_options = nil   # PlatformMap or nil
+  var link_options    = nil   # PlatformMap or nil
+  var defines         = nil   # DefineSet or nil
+
+  # scalar overrides (nil = inherit from project defaults)
+  var std      = nil
+  var compiler = nil
+  var linker   = nil
+
+  BuildProfile(name) {
+    self.name = name
+  }
+
+  static from_raw(name, raw) {
+    if !raw { return BuildProfile(name) }
+    var bp       = BuildProfile(name)
+    bp.inherits  = raw.get('inherits', nil)
+
+    if raw.contains('compile_options') {
+      bp.compile_options = PlatformMap.from_raw(raw['compile_options'])
+    }
+    if raw.contains('link_options') {
+      bp.link_options = PlatformMap.from_raw(raw['link_options'])
+    }
+    if raw.contains('defines') {
+      bp.defines = DefineSet.from_raw(raw['defines'])
+    }
+    bp.std      = raw.get('std',      nil)
+    bp.compiler = raw.get('compiler', nil)
+    bp.linker   = raw.get('linker',   nil)
+    return bp
+  }
+
+  static map_from_raw(raw) {
+    if !raw { return {} }
+    var profiles = {}
+    for name, data in raw {
+      profiles[name] = BuildProfile.from_raw(name, data)
+    }
+    return profiles
+  }
+
+  to_dict() {
+    var out = {}
+    if self.inherits        { out['inherits']        = self.inherits }
+    if self.compile_options { out['compile_options'] = self.compile_options.to_dict() }
+    if self.link_options    { out['link_options']    = self.link_options.to_dict() }
+    if self.defines         { out['defines']         = self.defines.to_dict() }
+    if self.std             { out['std']             = self.std }
+    if self.compiler        { out['compiler']        = self.compiler }
+    if self.linker          { out['linker']          = self.linker }
+    return out
+  }
+}
+
+# ── ProfileResolver ───────────────────────────────────────────────────────────
+
+/**
+ * Resolves `inherits` chains and produces a fully-merged BuildProfile.
+ * Detects cycles.
+ */
+class ProfileResolver {
+
+  # Initialize profiles with the default debug and release settings.
+  var _profiles = {
+    debug: BuildProfile('debug'),
+    release: BuildProfile('release'),
+  }   # name → BuildProfile
+
+  ProfileResolver(profiles) {
+    if profiles and is_dict(profiles) {
+      self._profiles.extend(profiles)
+    }
+  }
+
+  /**
+   * Return a new BuildProfile that is the result of merging the full
+   * inheritance chain for `name` (leaf wins over parent).
+   */
+  resolve(name) {
+    var chain = self._build_chain(name, [])
+    return self._merge_chain(chain)
+  }
+
+  _build_chain(name, seen) {
+    if seen.contains(name) {
+      raise Exception('kite: circular profile inheritance detected: ${" -> ".join(seen)} -> ${name}')
+    }
+    if !self._profiles.contains(name) {
+      raise Exception('kite: unknown profile "${name}"')
+    }
+    seen.append(name)
+    var profile = self._profiles[name]
+    var chain   = []
+    if profile.inherits {
+      chain.extend(self._build_chain(profile.inherits, seen))
+    }
+    chain.append(profile)
+    return chain
+  }
+
+  _merge_chain(chain) {
+    var merged = BuildProfile('__merged__')
+    merged.compile_options = PlatformMap()
+    merged.link_options    = PlatformMap()
+    merged.defines         = DefineSet()
+
+    for profile in chain {
+      # list fields: append all entries
+      if profile.compile_options {
+        for entry in profile.compile_options._entries {
+          merged.compile_options.set(entry['expr'], entry['value'])
+        }
+      }
+      if profile.link_options {
+        for entry in profile.link_options._entries {
+          merged.link_options.set(entry['expr'], entry['value'])
+        }
+      }
+      if profile.defines {
+        for entry in profile.defines.p_map._entries {
+          merged.defines.p_map.set(entry['expr'], entry['value'])
+        }
+      }
+      # scalar fields: last wins
+      if profile.std      { merged.std      = profile.std }
+      if profile.compiler { merged.compiler = profile.compiler }
+      if profile.linker   { merged.linker   = profile.linker }
+    }
+    return merged
+  }
+}
+
+# ── ProjectDefaults ───────────────────────────────────────────────────────────
+
+/**
+ * Global defaults inherited by every target unless the target overrides them.
+ *
+ *   defaults:
+ *     std:
+ *       c:   c11
+ *       cxx: c++17
+ *     compiler:
+ *       "*":     cc
+ *       linux:   gcc
+ *       macos:   clang
+ *       windows: cl
+ *     linker:
+ *       "*":     lld
+ *       linux:   ld
+ *       macos:   ld
+ *       windows: link
+ *     output_dir: dist
+ */
+class ProjectDefaults {
+
+  var std        = nil   # LanguageStandard or nil
+  var compiler   = nil   # PlatformMap → compiler name
+  var linker     = nil   # PlatformMap → linker name
+  var output_dir = 'dist'
+
+  ProjectDefaults() {
+    self.compiler = PlatformMap()
+    self.compiler.set('*', 'cc')
+    self.linker   = PlatformMap()
+    self.linker.set('*', 'lld')
+    self.linker.set('linux', 'ld')
+    self.linker.set('macos', 'ld')
+    self.linker.set('windows', 'link')
+  }
+
+  static from_raw(raw) {
+    if !raw { return ProjectDefaults() }
+
+    var pd = ProjectDefaults()
+    if raw.contains('std') {
+      pd.std = LanguageStandard.from_raw(raw['std'])
+    }
+    if raw.contains('compiler') {
+      pd.compiler = PlatformMap.from_raw(raw['compiler'])
+    }
+    if raw.contains('linker') {
+      pd.linker = PlatformMap.from_raw(raw['linker'])
+    }
+    pd.output_dir = raw.get('output_dir', 'dist')
+    return pd
+  }
+
+  to_dict() {
+    var out = { 'output_dir': self.output_dir }
+    if self.std      { out['std']      = self.std.to_dict() }
+    if self.compiler { out['compiler'] = self.compiler.to_dict() }
+    if self.linker   { out['linker']   = self.linker.to_dict() }
+    return out
+  }
+}
+
+# ── BuildHooks ────────────────────────────────────────────────────────────────
+
+/**
+ * Lifecycle scripts run at project level.
+ *
+ *   hooks:
+ *     pre_build:    [scripts/gen_version.sh]
+ *     post_build:   [scripts/sign.sh]
+ *     pre_test:     []
+ *     post_install: [scripts/verify.sh]
+ */
+class BuildHooks {
+
+  var pre_fetch    = nil   # PlatformMap → list of FetchStep
+  var pre_build    = []
+  var post_build   = []
+  var pre_test     = []
+  var post_test    = []
+  var pre_install  = []
+  var post_install = []
+
+  BuildHooks() {}
+
+  static from_raw(raw) {
+    if !raw { return BuildHooks() }
+    var bh          = BuildHooks()
+
+    if raw.contains('pre_fetch') {
+      bh.pre_fetch = PlatformMap.from_raw(raw['pre_fetch'])
+    }
+
+    bh.pre_build    = raw.get('pre_build',    [])
+    bh.post_build   = raw.get('post_build',   [])
+    bh.pre_test     = raw.get('pre_test',     [])
+    bh.post_test    = raw.get('post_test',    [])
+    bh.pre_install  = raw.get('pre_install',  [])
+    bh.post_install = raw.get('post_install', [])
+
+    return bh
+  }
+
+  all_for(phase) {
+    if phase == 'pre_fetch'    { return self.pre_fetch }
+    if phase == 'pre_build'    { return self.pre_build }
+    if phase == 'post_build'   { return self.post_build }
+    if phase == 'pre_test'     { return self.pre_test }
+    if phase == 'post_test'    { return self.post_test }
+    if phase == 'pre_install'  { return self.pre_install }
+    if phase == 'post_install' { return self.post_install }
+    return []
+  }
+
+  to_dict() {
+    return {
+      'pre_fetch':    self.pre_fetch ? self.pre_fetch.to_dict() : nil,
+      'pre_build':    self.pre_build,
+      'post_build':   self.post_build,
+      'pre_test':     self.pre_test,
+      'post_test':    self.post_test,
+      'pre_install':  self.pre_install,
+      'post_install': self.post_install,
+    }
+  }
+}
+
+# ── InstallFile ───────────────────────────────────────────────────────────────
+
+class InstallFile {
+  var src  = ''
+  var dest = ''
+
+  InstallFile(src, dest) {
+    self.src  = src
+    self.dest = dest
+  }
+
+  static from_raw(raw) {
+    if is_string(raw) { return InstallFile(raw, raw) }
+    return InstallFile(raw.get('src', ''), raw.get('dest', ''))
+  }
+
+  to_dict() { return { 'src': self.src, 'dest': self.dest } }
+}
+
+# ── InstallManifest ───────────────────────────────────────────────────────────
+
+/**
+ * Declares what `kite install` copies and where.
+ *
+ *   install:
+ *     targets:  [coroutine]         # which built artifacts to install
+ *     headers:  include/            # directory tree; structure preserved
+ *     files:
+ *       - src:  coroutine.zu
+ *         dest: share/zuri/modules/
+ */
+class InstallManifest {
+
+  var targets = []   # list of target names whose binaries to install
+  var headers = nil  # source directory path (string) or nil
+  var files   = []   # list of InstallFile
+
+  InstallManifest() {}
+
+  static from_raw(raw) {
+    if !raw { return InstallManifest() }
+    var im     = InstallManifest()
+    im.targets = raw.get('targets', [])
+    im.headers = raw.get('headers', nil)
+
+    var raw_files = raw.get('files', [])
+    for f in raw_files {
+      im.files.append(InstallFile.from_raw(f))
+    }
+    return im
+  }
+
+  to_dict() {
+    var out = {
+      'targets': self.targets,
+      'files':   self.files.map(@(f) { return f.to_dict() }),
+    }
+    if self.headers { out['headers'] = self.headers }
+    return out
+  }
+}
+
+# ── WorkspaceConfig ───────────────────────────────────────────────────────────
+
+/**
+ * Monorepo workspace declaration.
+ * kite performs a topological sort across members using their `link_targets`
+ * to determine build order.
+ *
+ *   workspace:
+ *     members:
+ *       - libs/core
+ *       - libs/net
+ *       - apps/cli
+ *       - tests
+ */
+class WorkspaceConfig {
+
+  var members = []   # list of relative paths to sub-project kite.yaml files
+
+  WorkspaceConfig() {}
+
+  static from_raw(raw) {
+    if !raw { return nil }
+    var wc    = WorkspaceConfig()
+    wc.members = raw.get('members', [])
+    return wc
+  }
+
+  to_dict() { return { 'members': self.members } }
+}
+
+# ── TestConfig ────────────────────────────────────────────────────────────────
+
+/**
+ * Test runner settings for `type: test` targets.
+ * Can also appear inline inside a target.
+ *
+ *   # in a target block:
+ *   runner:      zuri
+ *   runner_args: [--verbose]
+ *   timeout:     30
+ */
+class TestConfig {
+
+  var runner      = nil    # executable to invoke (nil = run the binary itself)
+  var runner_args = []     # extra arguments
+  var timeout     = 60     # seconds per test run
+
+  TestConfig() {}
+
+  static from_raw(raw) {
+    if !raw { return TestConfig() }
+    var tc         = TestConfig()
+    tc.runner      = raw.get('runner',      nil)
+    tc.runner_args = raw.get('runner_args', [])
+    tc.timeout     = raw.get('timeout',     60)
+    return tc
+  }
+
+  to_dict() {
+    return {
+      'runner':      self.runner,
+      'runner_args': self.runner_args,
+      'timeout':     self.timeout,
+    }
+  }
+}

@@ -1,0 +1,377 @@
+import ..app.intent.types {
+  Version, VersionRequirement, LanguageStandard, EnvVar,
+}
+
+test('Semantic versioning', @{
+  it('should correctly parse version string', @{
+    var v = Version('1.2.3')
+
+    expect(v.major).to_be(1)
+    expect(v.minor).to_be(2)
+    expect(v.patch).to_be(3)
+  })
+
+  it('should satisfy request for exact version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('1.0.1')).to_be_true()
+  })
+
+  it('should not satisfy request for different exact version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('1.0.2')).to_be_false()
+  })
+
+  it('should satisfy >= for exact version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('>=1.0.1')).to_be_true()
+  })
+
+  it('should satisfy >= for lower version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('>=0.9.0')).to_be_true()
+  })
+
+  it('should not satisfy >= for higher version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('>=1.1.0')).to_be_false()
+  })
+
+  it('should satisfy <= for exact version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('<=1.0.1')).to_be_true()
+  })
+
+  it('should satisfy <= for higher version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('<=1.0.2')).to_be_true()
+  })
+
+  it('should not satisfy <= for lower version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('<=0.9.0')).to_be_false()
+  })
+
+  it('should not satisfy > for exact version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('>1.0.1')).to_be_false()
+  })
+
+  it('should satisfy > for lower version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('>0.9.0')).to_be_true()
+  })
+
+  it('should not satisfy > for higher version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('>1.1.0')).to_be_false()
+  })
+
+  it('should satisfy ^ for same major version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.0.0')).to_be_true()
+  })
+
+  it('should not satisfy ^ for lower major version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^0.9.0')).to_be_false()
+  })
+
+  it('should not satisfy ^ for higher major version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^2.0.0')).to_be_false()
+  })
+
+  it('should satisfy ^ for same major and minor version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.0.0')).to_be_true()
+  })
+
+  it('should satisfy ^ for same minor', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.0.0')).to_be_true()
+  })
+
+  it('should satisfy ^ for lower minor', @{
+    var v = Version('1.1.1')
+    expect(v.satisfies('^1.0.0')).to_be_true()
+  })
+
+  it('should not satisfy ^ for higher minor', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.1.0')).to_be_false()
+  })
+
+  it('should not satisfy ^ for same patch', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.0.1')).to_be_true()
+  })
+
+  it('should satisfy ^ for lower patch', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.0.0')).to_be_true()
+  })
+
+  it('should not satisfy ^ for higher patch', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.0.2')).to_be_false()
+  })
+
+  it('should satisfy ^ for exact version', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('^1.0.1')).to_be_true()
+  })
+
+  it('should satisfy ~ for same major and minor', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('~1.0.0')).to_be_true()
+  })
+
+  it('should not satisfy ~ for lower major and minor', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('~0.9.0')).to_be_false()
+  })
+
+  it('should not satisfy ~ for higher minor', @{
+    var v = Version('1.0.1')
+    expect(v.satisfies('~1.1.0')).to_be_false()
+  })
+
+  it('should not satisfy ~ for higher minor', @{
+    var v = Version('1.1.1')
+    expect(v.satisfies('~1.0.0')).to_be_false()
+  })
+
+  it('should satisfy ~ for exact version', @{
+    var v = Version('1.1.1')
+    expect(v.satisfies('~1.1.1')).to_be_true()
+  })
+
+  it('should not satisfy ~ for higher patch', @{
+    var v = Version('1.1.1')
+    expect(v.satisfies('~1.1.2')).to_be_false()
+  })
+
+  it('should satisfy ~ for lower patch', @{
+    var v = Version('1.1.1')
+    expect(v.satisfies('~1.1.0')).to_be_true()
+  })
+
+  it('should return itself when called with to_string', @{
+    var v = Version('1.1.1')
+    expect(to_string(v)).to_be('1.1.1')
+  })
+
+  it('should maintain its original form called with to_string', @{
+    expect(to_string(Version('1.1.1'))).to_be('1.1.1')
+    expect(to_string(Version('>1.1.1'))).to_be('>1.1.1')
+    expect(to_string(Version('>=1.1.1'))).to_be('>=1.1.1')
+    expect(to_string(Version('<=1.1.1'))).to_be('<=1.1.1')
+    expect(to_string(Version('<1.1.1'))).to_be('<1.1.1')
+    expect(to_string(Version('~1.1.1'))).to_be('~1.1.1')
+    expect(to_string(Version('^1.1.1'))).to_be('^1.1.1')
+  })
+})
+
+test('Version Requirement', @{
+  it('should correctly parse version requirements raw dictionary', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+
+    expect(v).to_be_instance_of(VersionRequirement)
+    expect(v.kite).to_be('^1.0.1')
+    expect(v.zuri).to_be('>=1.0.1')
+  })
+
+  it('should allow optional zuri version when parsing raw dictionary', @{
+    var v = VersionRequirement.from_raw({ kite: '>=1.0.1' })
+    expect(v.kite).to_be('>=1.0.1')
+    expect(v.zuri).to_be(nil)
+  })
+
+  it('should allow optional kite version when parsing raw dictionary', @{
+    var v = VersionRequirement.from_raw({ zuri: '>=1.0.1' })
+    expect(v.kite).to_be(nil)
+    expect(v.zuri).to_be('>=1.0.1')
+  })
+
+  it('should return errors in list', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    expect(v.validate()).to_be_list()
+  })
+
+  it('should return no error on validate if no argument is given', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    expect(v.validate()).to_be([])
+  })
+
+  it('should return error for invalid zuri version', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    expect(v.validate(nil, '1.0.0')).to_contain('zuri 1.0.0 does not satisfy required >=1.0.1')
+  })
+
+  it('should return error for invalid kite version', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    expect(v.validate('1.0.0', nil)).to_contain('kite 1.0.0 does not satisfy required ^1.0.1')
+  })
+
+  it('should return error for both kite and zuri version', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    var result = v.validate('1.0.0', '1.0.0')
+    
+    expect(result).to_have_length(2)
+    expect(result).to_contain_all([
+      'kite 1.0.0 does not satisfy required ^1.0.1',
+      'zuri 1.0.0 does not satisfy required >=1.0.1',
+    ])
+  })
+
+  it('should only return error for zuri if kite version passes', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    var result = v.validate('1.0.1', '1.0.0')
+    
+    expect(result).to_have_length(1)
+    expect(result).to_contain('zuri 1.0.0 does not satisfy required >=1.0.1')
+  })
+
+  it('should only return error for kite if zuri version passes', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    var result = v.validate('1.0.0', '1.0.1')
+    
+    expect(result).to_have_length(1)
+    expect(result).to_contain('kite 1.0.0 does not satisfy required ^1.0.1')
+  })
+
+  it('should have empty error when both kite and zuri passes', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    expect(v.validate('1.0.1', '1.0.1')).to_be_empty()
+  })
+
+  it('should only return available keys via to_dict', @{
+    var v = VersionRequirement.from_raw({ kite: '^1.0.1' })
+    expect(v.to_dict()).to_have_key('kite')
+    expect(v.to_dict()).not.to_have_key('zuri')
+
+    v = VersionRequirement.from_raw({ zuri: '^1.0.1' })
+    expect(v.to_dict()).to_have_key('zuri')
+    expect(v.to_dict()).not.to_have_key('kite')
+
+    v = VersionRequirement.from_raw({ kite: '^1.0.1', zuri: '>=1.0.1' })
+    expect(v.to_dict()).to_have_key('kite')
+    expect(v.to_dict()).to_have_key('zuri')
+  })
+})
+
+
+test('Language Standard', @{
+  it('should parse c and cxx correctly from raw dictionary', @{
+    var l = LanguageStandard.from_raw({ c: 'c11', cxx: 'c++17' })
+
+    expect(l).to_be_instance_of(LanguageStandard)
+    expect(l.c).to_be('c11')
+    expect(l.cxx).to_be('c++17')
+  })
+
+  it('should generate correct flags for c and cxx for clang', @{
+    var l = LanguageStandard.from_raw({ c: 'c11', cxx: 'c++17' })
+    var flags = l.to_flags('clang')
+
+    expect(flags).to_have_length(2)
+    expect(flags).to_contain_all([
+      '-std=c11',
+      '-std=c++17',
+    ])
+  })
+
+  it('should generate correct flags for c and cxx for msvc', @{
+    var l = LanguageStandard.from_raw({ c: 'c11', cxx: 'c++17' })
+    var flags = l.to_flags('msvc')
+
+    expect(flags).to_have_length(2)
+    expect(flags).to_contain_all([
+      '/std:c11',
+      '/std:c++17',
+    ])
+  })
+
+  it('should reject invalid c standards', @{
+    var l = @{ LanguageStandard.from_raw({ c: 'c76' }) }
+    expect(l).to_throw()
+  })
+
+  it('should reject invalid cxx standards', @{
+    var l = @{ LanguageStandard.from_raw({ cxx: 'c++76' }) }
+    expect(l).to_throw()
+  })
+
+  it('should reject all if any of c or cxx standard is invalid', @{
+    var l = @{ LanguageStandard.from_raw({ c: 'c11', cxx: 'c++76' }) }
+    expect(l).to_throw()
+
+    l = @{ LanguageStandard.from_raw({ c: 'c12', cxx: 'c++23' }) }
+    expect(l).to_throw()
+  })
+
+  it('should not reject empty configuration', @{
+    var l = @{ LanguageStandard.from_raw({}) }
+    expect(l).to_not_throw()
+  })
+
+  it('should only return available keys via to_dict', @{
+    var v = LanguageStandard.from_raw({ c: 'c11' })
+    expect(v.to_dict()).to_have_key('c')
+    expect(v.to_dict()).not.to_have_key('cxx')
+
+    v = LanguageStandard.from_raw({ cxx: 'c++23' })
+    expect(v.to_dict()).to_have_key('cxx')
+    expect(v.to_dict()).not.to_have_key('c')
+
+    v = LanguageStandard.from_raw({ c: 'c11', cxx: 'c++17' })
+    expect(v.to_dict()).to_have_key('c')
+    expect(v.to_dict()).to_have_key('cxx')
+  })
+})
+
+
+test('Environment Variable', @{
+  it('should parse env variable name correctly from raw dictionary', @{
+    var o = EnvVar.from_raw('output')
+
+    expect(o).to_be_instance_of(EnvVar)
+    expect(o.name).to_be('output')
+    expect(o.required).to_be_false()
+  })
+
+  it('should set required true if second parameter of from_raw is true', @{
+    var o = EnvVar.from_raw('output', true)
+    expect(o.required).to_be_true()
+  })
+
+  it('should return nil when set correctly', @{
+    var o = EnvVar.from_raw('output', true)
+    expect(o.validate({ output: 'path' })).to_be_nil()
+  })
+
+  it('should return error when set to nil', @{
+    var o = EnvVar.from_raw('output', true)
+    expect(o.validate({ output: nil })).to_be_string()
+  })
+
+  it('should return error when set', @{
+    var o = EnvVar.from_raw('output', true)
+    expect(o.validate()).to_be_string()
+  })
+
+  it('should not return error when set to empty string', @{
+    var o = EnvVar.from_raw('output', true)
+    expect(o.validate({ output: '' })).to_be_nil()
+  })
+
+  it('should not return error when not set and not required', @{
+    var o = EnvVar.from_raw('output', false)
+    expect(o.validate()).to_be_nil()
+  })
+
+  it('should not return error when set to nil and not required', @{
+    var o = EnvVar.from_raw('output', false)
+    expect(o.validate({ output: nil })).to_be_nil()
+  })
+})

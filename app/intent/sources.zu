@@ -1,0 +1,512 @@
+/**
+ * kite/intent/sources.zu
+ *
+ * Classes covering everything related to what gets compiled:
+ *   SourceSet        — glob-aware source file declarations
+ *   IncludeSet       — public/private include paths
+ *   DefineSet        — preprocessor macro declarations
+ *   FileOptions      — per-file compile-option overrides
+ *   GeneratorStep    — code-generation pre-build step
+ *   SystemLib        — pkg-config + fallback library descriptor
+ *   PackageDeps      — OS package manager prerequisites
+ */
+
+import .platform { PlatformMap }
+
+# ── SourceSet ────────────────────────────────────────────────────────────────
+
+/**
+ * Declares the source files for a target.
+ *
+ *   sources:
+ *     "*":     [src/ **\/ *.c]
+ *     x86_64:  [src/arch/x86_64.c]
+ *     arm64:   [src/arch/arm64.c]
+ *     exclude: [src/experimental/ **, src/deprecated.c]
+ *
+ * Rules:
+ *   - ** globs are recursive; * is single-directory.
+ *   - `exclude` always wins over include patterns.
+ *   - Sources from all matching platform keys are merged.
+ */
+class SourceSet {
+
+  var p_map     = nil   # PlatformMap → list of glob patterns
+  var _exclude = []    # list of glob patterns always excluded
+
+  SourceSet() {
+    self.p_map = PlatformMap()
+  }
+
+  static from_raw(raw) {
+    if !raw { return SourceSet() }
+    var ss = SourceSet()
+
+    if is_list(raw) {
+      ss.p_map.set('*', raw)
+      return ss
+    }
+
+    for key, value in raw {
+      if key == 'exclude' {
+        ss._exclude = is_list(value) ? value : [value]
+      } else {
+        ss.p_map.set(key, is_list(value) ? value : [value])
+      }
+    }
+    return ss
+  }
+
+  /**
+   * Return all resolved glob patterns for the given platform context.
+   * The caller (kite's file-system layer) is responsible for expanding globs.
+   */
+  patterns(ctx) {
+    return self.p_map.resolve(ctx)
+  }
+
+  /** Exclusion patterns (platform-independent). */
+  excludes() { return self._exclude }
+
+  to_dict() {
+    var out = self.p_map.to_dict()
+    if self._exclude.length() > 0 {
+      out['exclude'] = self._exclude
+    }
+    return out
+  }
+}
+
+# ── IncludeSet ───────────────────────────────────────────────────────────────
+
+/**
+ * Declares include search paths with public/private visibility.
+ *
+ *   includes:
+ *     public:            # propagated to all link_targets consumers
+ *       "*": [include]
+ *     private:           # only used when compiling this target
+ *       "*": [src/internal]
+ *
+ * Shorthand (array → treated as public/ *):
+ *   includes: [include]
+ */
+class IncludeSet {
+
+  var public_map  = nil   # PlatformMap
+  var private_map = nil   # PlatformMap
+
+  IncludeSet() {
+    self.public_map  = PlatformMap()
+    self.private_map = PlatformMap()
+  }
+
+  static from_raw(raw) {
+    if !raw { return IncludeSet() }
+    var inc = IncludeSet()
+
+    if is_list(raw) {
+      # shorthand: plain list → public/*
+      inc.public_map.set('*', raw)
+      return inc
+    }
+
+    if is_dict(raw) {
+      var has_visibility = raw.contains('public') or raw.contains('private')
+
+      if has_visibility {
+        if raw.contains('public') {
+          inc.public_map = PlatformMap.from_raw(raw['public'])
+        }
+        if raw.contains('private') {
+          inc.private_map = PlatformMap.from_raw(raw['private'])
+        }
+      } else {
+        # flat dict of platform expressions → public
+        inc.public_map = PlatformMap.from_raw(raw)
+      }
+    }
+
+    return inc
+  }
+
+  /** Paths to pass to the compiler for this target and all its consumers. */
+  resolve_public(ctx) {
+    return self.public_map.resolve(ctx)
+  }
+
+  /** Paths to pass to the compiler for this target only. */
+  resolve_private(ctx) {
+    return self.private_map.resolve(ctx)
+  }
+
+  /** All paths for this target's own compilation. */
+  resolve_all(ctx) {
+    var out = self.resolve_public(ctx)
+    out.extend(self.resolve_private(ctx))
+    return out
+  }
+
+  to_dict() {
+    return {
+      'public':  self.public_map.to_dict(),
+      'private': self.private_map.to_dict(),
+    }
+  }
+}
+
+# ── DefineSet ────────────────────────────────────────────────────────────────
+
+/**
+ * Preprocessor macro definitions — first-class, not buried in compile_options.
+ *
+ *   defines:
+ *     "*":     [VERSION="1.0.0", BUILDING_CORO=1]
+ *     debug:   [CORO_DEBUG=1]
+ *     release: [NDEBUG=1]
+ *
+ * Each entry is a bare name ("NDEBUG") or name=value ("VERSION=\"1.0.0\"").
+ * kite translates to -DNAME or -DNAME=VALUE (GCC/Clang) / /DNAME (MSVC).
+ */
+class DefineSet {
+
+  var p_map = nil   # PlatformMap → list of define strings
+
+  DefineSet() {
+    self.p_map = PlatformMap()
+  }
+
+  static from_raw(raw) {
+    if !raw { return DefineSet() }
+    var ds = DefineSet()
+    ds.p_map = PlatformMap.from_raw(raw)
+    return ds
+  }
+
+  /** Return raw define strings (NAME or NAME=VALUE) for given context. */
+  resolve(ctx) {
+    return self.p_map.resolve(ctx)
+  }
+
+  /**
+   * Return compiler flags (-DNAME or /DNAME) for the given context
+   * and compiler string.
+   */
+  to_flags(ctx, compiler) {
+    var defines = self.resolve(ctx)
+    var flags   = []
+    var prefix  = (compiler == 'msvc' or compiler == 'cl') ? '/D' : '-D'
+    for d in defines {
+      flags.append('${prefix}${d}')
+    }
+    return flags
+  }
+
+  merge(other) {
+    var ds = DefineSet()
+    for entry in self.p_map._entries {
+      ds.p_map.set(entry['expr'], entry['value'])
+    }
+    for entry in other.p_map._entries {
+      ds.p_map.set(entry['expr'], entry['value'])
+    }
+    return ds
+  }
+
+  to_dict() { return self.p_map.to_dict() }
+}
+
+# ── FileOptions ──────────────────────────────────────────────────────────────
+
+/**
+ * Per-file compile option overrides.
+ * Useful for vendored code, generated files, or single files that need
+ * different optimisation levels.
+ *
+ *   file_options:
+ *     src/vendor/stb_image.c:
+ *       compile_options:
+ *         "*": [-w, -O1]
+ *     src/generated/parser.c:
+ *       compile_options:
+ *         "*": [-w]
+ *       defines:
+ *         "*": [PARSER_GENERATED=1]
+ */
+class FileOptions {
+
+  var overrides  = {}   # path → { compile_options: PlatformMap, defines: DefineSet }
+
+  FileOptions() {}
+
+  static from_raw(raw) {
+    if !raw { return FileOptions() }
+    var fo = FileOptions()
+    for path, opts in raw {
+      var entry = {}
+      if opts.contains('compile_options') {
+        entry['compile_options'] = PlatformMap.from_raw(opts['compile_options'])
+      }
+      if opts.contains('defines') {
+        entry['defines'] = DefineSet.from_raw(opts['defines'])
+      }
+      fo.overrides [path] = entry
+    }
+    return fo
+  }
+
+  /** Returns the override dict for a specific file path, or nil. */
+  for_file(path) {
+    return self.overrides .get(path, nil)
+  }
+
+  has_override(path) {
+    return self.overrides .contains(path)
+  }
+
+  to_dict() {
+    var out = {}
+    for path, entry in self.overrides  {
+      var e = {}
+      if entry.contains('compile_options') {
+        e['compile_options'] = entry['compile_options'].to_dict()
+      }
+      if entry.contains('defines') {
+        e['defines'] = entry['defines'].to_dict()
+      }
+      out[path] = e
+    }
+    return out
+  }
+}
+
+# ── FetchStep ─────────────────────────────────────────────────────────────
+
+class FetchStep {
+  var url    = ''
+  var type   = ''    # 'git' | 'tar.gz' | 'tgz' | 'tar' | 'gz' | 'zip'
+  var target = nil   # destination directory, nil = build root
+
+  FetchStep() {}
+
+  static from_raw(raw) {
+    var fs    = FetchStep()
+    fs.url    = raw.get('url',    '')
+    fs.type   = raw.get('type',   '')
+    fs.target = raw.get('target', nil)
+    return fs
+  }
+
+  static list_from_raw(raw) {
+    if !raw { 
+      return [] 
+    }
+
+    var steps = []
+    for item in raw { 
+      steps.append(FetchStep.from_raw(item)) 
+    }
+
+    return steps
+  }
+
+  to_dict() {
+    return { 
+      'url': self.url, 
+      'type': self.type, 
+      'target': self.target, 
+    }
+  }
+}
+
+# ── GeneratorStep ─────────────────────────────────────────────────────────────
+
+/**
+ * A single code-generation step run before compilation.
+ * kite hashes inputs and skips the step when nothing has changed.
+ *
+ *   generators:
+ *     - tool:    flex
+ *       inputs:  [src/lexer.l]
+ *       outputs: [src/gen/lexer.c, src/gen/lexer.h]
+ *     - tool:    scripts/gen_opcodes.py
+ *       args:    [--verbose]
+ *       inputs:  [opcodes.yaml]
+ *       outputs: [src/gen/opcodes.c, include/opcodes.h]
+ */
+class GeneratorStep {
+
+  var tool    = ''   # executable name or path
+  var args    = []   # extra arguments (before inputs)
+  var inputs  = []   # files that, when changed, trigger a rerun
+  var outputs = []   # files produced; added to compilation sources automatically
+
+  GeneratorStep() {}
+
+  static from_raw(raw) {
+    var gs      = GeneratorStep()
+    gs.tool     = raw.get('tool',    '')
+    gs.args     = raw.get('args',    [])
+    gs.inputs   = raw.get('inputs',  [])
+    gs.outputs  = raw.get('outputs', [])
+    return gs
+  }
+
+  static list_from_raw(raw) {
+    if !raw { return [] }
+    var steps = []
+    for item in raw {
+      steps.append(GeneratorStep.from_raw(item))
+    }
+    return steps
+  }
+
+  /** The command line kite would invoke. */
+  command() {
+    var parts = [self.tool]
+    parts.extend(self.args)
+    parts.extend(self.inputs)
+    return ' '.join(parts)
+  }
+
+  to_dict() {
+    return {
+      'tool':    self.tool,
+      'args':    self.args,
+      'inputs':  self.inputs,
+      'outputs': self.outputs,
+    }
+  }
+}
+
+# ── SystemLibFallback ─────────────────────────────────────────────────────────
+
+class SystemLibFallback {
+
+  var includes     = nil   # PlatformMap
+  var link_options = nil   # PlatformMap
+
+  SystemLibFallback() {}
+
+  static from_raw(raw) {
+    if !raw { return nil }
+    var fb = SystemLibFallback()
+    if raw.contains('includes') {
+      fb.includes = PlatformMap.from_raw(raw['includes'])
+    }
+    if raw.contains('link_options') {
+      fb.link_options = PlatformMap.from_raw(raw['link_options'])
+    }
+    return fb
+  }
+
+  to_dict() {
+    var out = {}
+    if self.includes     { out['includes']     = self.includes.to_dict() }
+    if self.link_options { out['link_options'] = self.link_options.to_dict() }
+    return out
+  }
+}
+
+# ── SystemLib ─────────────────────────────────────────────────────────────────
+
+/**
+ * A system library resolved via pkg-config with optional manual fallback.
+ *
+ *   system_libs:
+ *     - pkg_config: "openssl >= 1.1"
+ *       fallback:
+ *         includes:
+ *           windows: [C:/OpenSSL/include]
+ *         link_options:
+ *           windows: [libssl.lib, libcrypto.lib]
+ *           linux:   [-lssl, -lcrypto]
+ */
+class SystemLib {
+
+  var pkg_config = ''    # "name" or "name >= version"
+  var fallback   = nil   # SystemLibFallback or nil
+
+  SystemLib() {}
+
+  static from_raw(raw) {
+    var sl = SystemLib()
+    sl.pkg_config = raw.get('pkg_config', '')
+    if raw.contains('fallback') {
+      sl.fallback = SystemLibFallback.from_raw(raw['fallback'])
+    }
+    return sl
+  }
+
+  static list_from_raw(raw) {
+    if !raw { return [] }
+    var libs = []
+    for item in raw {
+      libs.append(SystemLib.from_raw(item))
+    }
+    return libs
+  }
+
+  /** pkg-config name without version constraint. */
+  lib_name() {
+    return self.pkg_config.split(' ')[0]
+  }
+
+  /** pkg-config version constraint string or nil. */
+  version_constraint() {
+    var parts = self.pkg_config.split(' ')
+    if parts.length() < 2 { return nil }
+    return ' '.join(parts[1,])
+  }
+
+  to_dict() {
+    var out = { 'pkg_config': self.pkg_config }
+    if self.fallback { out['fallback'] = self.fallback.to_dict() }
+    return out
+  }
+}
+
+# ── PackageDeps ───────────────────────────────────────────────────────────────
+
+/**
+ * OS-level package manager prerequisites.
+ * These are informational for the user and used by `kite deps` to
+ * install system packages before building.
+ *
+ *   package_dependencies:
+ *     "apt | yum": [libssl-dev, flex]
+ *     brew:        [openssl, flex]
+ *     pacman:      [openssl, flex]
+ *     winget:      [OpenSSL.OpenSSL]
+ */
+class PackageDeps {
+
+  var _entries = {}   # manager_expr → list of package names
+
+  PackageDeps() {}
+
+  static from_raw(raw) {
+    if !raw { return PackageDeps() }
+    var pd = PackageDeps()
+    for key, value in raw {
+      pd._entries[key] = is_list(value) ? value : [value]
+    }
+    return pd
+  }
+
+  /**
+   * Return the list of packages for a given package manager name.
+   * Keys may be pipe-separated alternatives: "apt | yum".
+   */
+  for_manager(manager) {
+    for key, pkgs in self._entries {
+      var managers = key.split('|').map(@(m) { return m.trim() })
+      if managers.contains(manager) {
+        return pkgs
+      }
+    }
+    return []
+  }
+
+  to_dict() { return self._entries }
+}

@@ -1,0 +1,442 @@
+/**
+ * kite/utils.zu
+ *
+ * Utility functions for:
+ *   - Platform detection (OS, arch, compiler availability)
+ *   - Program path resolution (PATH + system dirs + Windows Program Files)
+ *   - Glob pattern expansion with ** recursive support
+ *   - Shell command quoting
+ *   - Filesystem helpers (mkdir -p, copy, hash)
+ *   - Coloured terminal output
+ */
+
+import os
+import io
+import hash
+import colors
+
+# ── Platform detection ───────────────────────────────────────────────────────
+
+var is_windows = os.platform == 'windows'
+var is_macos   = os.platform == 'macos'
+var is_linux   = os.platform == 'linux'
+var is_unix    = is_linux or is_macos
+
+/**
+ * Detect the host architecture from the OS or common env hints.
+ * Returns one of: x86_64 | arm64 | arm | x86
+ */
+def detect_arch() {
+  # Try environment hints first (cross-compile scenarios)
+  var env_arch = os.get_env('KITE_ARCH', os.info().machine)
+  if env_arch { 
+    return env_arch.lower() 
+  }
+
+  var machine = os.get_env('PROCESSOR_ARCHITECTURE', nil)   # Windows
+  if machine {
+    machine = machine.lower()
+    if machine.contains('amd64') or machine.contains('x86_64') { 
+      return 'x86_64' 
+    }
+    if machine.contains('arm64') or machine.contains('aarch64') { 
+      return 'arm64' 
+    }
+    if machine.contains('arm')   { 
+      return 'arm' 
+    }
+    if machine.contains('x86')   { 
+      return 'x86' 
+    }
+  }
+
+  # POSIX: uname -m
+  if is_unix {
+    var res = os.exec('uname -m')
+    if res and res.exit_code == 0 {
+      var m = res.output.trim().lower()
+
+      using m {
+        when 'x86_64', 'amd64' {
+          return 'x86_64' 
+        } 
+        when 'aarch64', 'arm64' {
+          return 'arm64' 
+        } 
+        when 'i386', 'i686' {
+          return 'x86' 
+        }
+        default {
+          return m
+        }
+      }
+    }
+  }
+
+  return 'x86_64'   # safe fallback
+}
+
+# ── Program resolution ───────────────────────────────────────────────────────
+
+def find_app_in_system_path(name) {
+  var paths = []
+
+  if is_windows {
+    paths.extend([
+      'C:\\Windows\\system32',
+      'C:\\Windows',
+    ])
+    if !['.exe', '.msi', '.bat', '.cmd'].some(@(x) { return name.ends_with(x) }) {
+      name += '.exe'
+    }
+  } else {
+    paths.extend([
+      '/usr/bin',
+      '/bin',
+      '/usr/local/bin',
+    ])
+  }
+
+  if is_macos {
+    paths.append('/opt/homebrew/bin')
+  }
+
+  for path in paths {
+    var full_path = os.join_paths(path, name)
+    if os.dir_exists(path) and file(full_path).exists() {
+      return full_path
+    }
+  }
+
+  if is_windows {
+    paths = [
+      'C:\\Program Files',
+      'C:\\Program Files (x86)',
+    ]
+    for path in paths {
+      var sub_dirs = os.read_dir(path)
+      for dir in sub_dirs {
+        var base_dir  = os.join_paths(path, dir)
+        var base_path = os.join_paths(base_dir, name)
+        var bin_path  = os.join_paths(base_dir, 'bin', name)
+        var cmd_path  = os.join_paths(base_dir, 'cmd', name)
+        if      file(base_path).exists() { return base_path }
+        else if file(bin_path).exists()  { return bin_path  }
+        else if file(cmd_path).exists()  { return cmd_path  }
+      }
+    }
+  }
+
+  return nil
+}
+
+def find_app_in_path(name) {
+  var raw_paths = os.get_env('PATH', nil)
+  if raw_paths == nil { return find_app_in_system_path(name) }
+
+  var paths = raw_paths.split(is_windows ? ';' : ':')
+  for path in paths {
+    var full_path = os.join_paths(path, name)
+    if os.dir_exists(path) and file(full_path).exists() {
+      return full_path
+    }
+  }
+
+  return find_app_in_system_path(name)
+}
+
+/**
+ * Locate a compiler binary, trying several common names.
+ * Returns the full path or nil.
+ */
+def find_compiler(preferred) {
+  if !preferred {
+    preferred = 'cc'
+  }
+
+  var candidates = [preferred]
+
+  if preferred == 'cc' {
+    candidates = is_macos ? ['clang', 'gcc', 'cc'] : (
+      is_windows ? ['cl', 'clang', 'gcc'] : ['gcc', 'clang', 'cc']
+    )
+  } else if preferred == 'c++' or preferred == 'cxx' {
+    candidates = is_macos ? ['clang++', 'g++', 'c++'] : (
+      is_windows ? ['cl', 'clang++', 'gcc++'] : ['g++', 'clang++', 'c++']
+    )
+  } else if preferred == 'msvc' or preferred == 'cl' {
+    candidates = ['cl', 'clang', 'gcc']
+  }
+
+  for name in candidates {
+    var found = find_app_in_path(name)
+    if found { 
+      return found 
+    }
+  }
+
+  return nil
+}
+
+/**
+ * Check whether pkg-config is available.
+ */
+def has_pkg_config() {
+  return find_app_in_path('pkg-config') != nil
+}
+
+/**
+ * Run pkg-config and return {cflags, libs} or nil on failure.
+ */
+def run_pkg_config(spec) {
+  var pc = find_app_in_path('pkg-config')
+  if !pc { return nil }
+
+  var cflags_res = os.exec('${pc} --cflags ${spec}')
+  var libs_res   = os.exec('${pc} --libs   ${spec}')
+
+  if cflags_res.exit_code != 0 or libs_res.exit_code != 0 { return nil }
+
+  return {
+    'cflags': cflags_res.output.trim().split(' ').filter(@(s) { return s != '' }),
+    'libs':   libs_res.output.trim().split(' ').filter(@(s) { return s != '' }),
+  }
+}
+
+# ── Glob expansion ───────────────────────────────────────────────────────────
+
+/**
+ * Expand a list of glob patterns (supporting ** recursive globs) relative
+ * to `base_dir`, minus any files matching `excludes` patterns.
+ *
+ * Returns a sorted, deduplicated list of absolute file paths.
+ */
+def expand_globs(base_dir, patterns, excludes) {
+  if !excludes { excludes = [] }
+  var result = {}   # use dict as set for dedup
+
+  for pattern in patterns {
+    var full_pattern = os.join_paths(base_dir, pattern)
+    for path in _glob(full_pattern, base_dir) {
+      if !_matches_any(path, base_dir, excludes) {
+        result[path] = true
+      }
+    }
+  }
+
+  var paths = result.keys()
+  paths.sort()
+  return paths
+}
+
+def _glob(pattern, base_dir) {
+  # Normalise separators
+  pattern = pattern.replace('\\', '/')
+
+  # Split at first ** to handle recursive case
+  if pattern.contains('**') {
+    var parts    = pattern.split('**')
+    var prefix   = parts[0].rtrim('/')
+    var suffix   = '**'.join(parts[1,]).ltrim('/')
+    var root_dir = prefix == '' ? base_dir : prefix
+
+    if !os.dir_exists(root_dir) { return [] }
+
+    var all_files = _walk(root_dir)
+    var matched   = []
+    for f in all_files {
+      if _match_suffix(f, suffix) {
+        matched.append(f)
+      }
+    }
+    return matched
+  }
+
+  # No **, try as a simple wildcard in the last component
+  var sep     = is_windows ? '\\' : '/'
+  var parts   = pattern.split(sep)
+  var dir_part  = sep.join(parts[0, parts.length() - 1])
+  var file_part = parts[parts.length() - 1]
+
+  if !os.dir_exists(dir_part) { return [] }
+
+  var entries = []
+  catch {
+    entries = os.read_dir(dir_part)
+  } as e 
+  if e {
+    return []
+  }
+
+  var results = []
+  for entry in entries {
+    var full = os.join_paths(dir_part, entry)
+    if _wildcard_match(entry, file_part) {
+      if file(full).exists() {
+        results.append(full)
+      }
+    }
+  }
+  return results
+}
+
+def _walk(dir) {
+  var results = []
+  var entries = []
+  catch {
+    entries = os.read_dir(dir)
+  } as e 
+  if e {
+    return results
+  }
+
+  for entry in entries {
+    var full = os.join_paths(dir, entry)
+    if os.dir_exists(full) {
+      results.extend(_walk(full))
+    } else if file(full).exists() {
+      results.append(full)
+    }
+  }
+  return results
+}
+
+def _match_suffix(path, suffix) {
+  if suffix == '' or suffix == '*' { return true }
+  # Convert suffix glob to a simple ends_with check for common cases
+  if !suffix.contains('*') { return path.ends_with(suffix) }
+  # Simple *.ext pattern
+  if suffix.starts_with('*.') {
+    var ext = suffix[1,]
+    return path.ends_with(ext)
+  }
+  return path.ends_with(suffix.replace('*', ''))
+}
+
+def _matches_any(path, base_dir, patterns) {
+  var rel = path.replace(base_dir, '').ltrim('/').ltrim('\\')
+  for pattern in patterns {
+    if _wildcard_match(rel, pattern) or
+       _wildcard_match(path, pattern) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Simple wildcard match: * matches any chars within a path component,
+ * ** is treated as match-all for full paths.
+ */
+def _wildcard_match(str, pattern) {
+  if pattern == '*' or pattern == '**' or pattern == '**/*' { return true }
+  if !pattern.contains('*') { return str == pattern or str.ends_with(pattern) }
+
+  # Convert glob pattern to a simple regex-like check
+  var parts = pattern.split('*')
+  var pos   = 0
+  for i, part in parts {
+    if part == '' { continue }
+    var idx = str.index_of(part, pos)
+    if idx == -1 { return false }
+    pos = idx + part.length()
+  }
+  return true
+}
+
+# ── Filesystem helpers ───────────────────────────────────────────────────────
+
+/**
+ * Recursively create directories (mkdir -p equivalent).
+ */
+def mkdirp(path) {
+  if os.dir_exists(path) { return }
+  var parts = path.replace('\\', '/').split('/')
+  var current = ''
+  for part in parts {
+    if part == '' { current = '/'; continue }
+    current = current == '' ? part : os.join_paths(current, part)
+    if !os.dir_exists(current) {
+      catch { 
+        os.create_dir(current) 
+      }
+    }
+  }
+}
+
+/**
+ * Copy a file, creating destination directories as needed.
+ */
+def copy_file(src, dest) {
+  mkdirp(os.dir_name(dest))
+  var data = file(src, 'rb').read()
+  file(dest, 'wb').write(data)
+}
+
+/**
+ * Return true if dest is older than src (i.e. needs rebuilding).
+ * If dest does not exist, always returns true.
+ */
+def needs_rebuild(src, dest) {
+  if !file(dest).exists() { return true }
+  var src_stat  = os.stat(src)
+  var dest_stat = os.stat(dest)
+  if !src_stat or !dest_stat { return true }
+  return src_stat['mtime'] > dest_stat['mtime']
+}
+
+/**
+ * Compute a fast hash of a file's contents for change detection.
+ * Returns a hex string.
+ */
+def file_hash(path) {
+  catch {
+    var data = file(path, 'rb').read()
+    return hash.md5(data)
+  }
+  return ''
+}
+
+# ── Shell quoting ────────────────────────────────────────────────────────────
+
+/**
+ * Quote a single argument for safe shell use.
+ */
+def shell_quote(arg) {
+  if is_windows {
+    if arg.contains(' ') or arg.contains('"') {
+      return '"' + arg.replace('"', '\\"') + '"'
+    }
+    return arg
+  }
+  if arg.contains(' ') or arg.contains("'") or arg.contains('"') or
+     arg.contains('$') or arg.contains('\\') {
+    return "'" + arg.replace("'", "'\\''") + "'"
+  }
+  return arg
+}
+
+/**
+ * Join a list of arguments into a shell command string.
+ */
+def build_command(parts) {
+  return ' '.join(parts.map(@(p) => shell_quote(p)))
+}
+
+# ── Terminal output ──────────────────────────────────────────────────────────
+
+var _use_color = !is_windows and os.get_env('NO_COLOR', nil) == nil
+
+def _color(code, text) {
+  if !_use_color { return text }
+  return colors.text(text, code)
+  # return '\033[${code}m${text}\033[0m'
+}
+
+def log_info(msg)    { echo _color(colors.text_color.blue, '  •') + ' ' + msg }
+def log_ok(msg)      { echo _color(colors.text_color.green, '  ✓') + ' ' + msg }
+def log_warn(msg)    { echo _color(colors.text_color.yellow, '  ⚠') + ' ' + msg }
+def log_error(msg)   { echo _color(colors.text_color.red, '  ✗') + ' ' + msg }
+def log_step(msg)    { echo _color(colors.text_color.magenta, '  →') + ' ' + msg }
+def log_header(msg)  { echo _color(colors.text_color.white, '\n── ' + msg + ' ' + ('─' * (40 - msg.length()))) }
+def log_cmd(cmd)     { echo _color(colors.text_color.white, '    $ ' + cmd) }

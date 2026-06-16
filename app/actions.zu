@@ -1,0 +1,395 @@
+/**
+ * kite/actions.zu
+ *
+ * Higher-level actions invoked by the CLI:
+ *
+ *   TestRunner     — executes `type: test` targets and reports results
+ *   Installer      — copies artifacts / headers / files to install prefix
+ *   DepsInstaller  — installs OS-level package_dependencies via apt/brew/etc.
+ *   Cleaner        — removes build artefacts and cache
+ */
+
+import os
+import io
+import .utils {
+  mkdirp, copy_file, find_app_in_path,
+  log_info, log_ok, log_warn, log_error, log_step, log_header, log_cmd,
+  is_windows, is_macos, is_linux, build_command
+}
+
+# ── TestResult ────────────────────────────────────────────────────────────────
+
+class TestResult {
+  var target_name = ''
+  var passed      = false
+  var exit_code   = 0
+  var output      = ''
+  var duration_ms = 0
+}
+
+# ── TestRunner ────────────────────────────────────────────────────────────────
+
+class TestRunner {
+
+  var _project_root = ''
+  var _verbose      = false
+
+  TestRunner(project_root, verbose) {
+    self._project_root = project_root
+    self._verbose      = verbose ? verbose : false
+  }
+
+  /**
+   * Run all test-type BuildResults.
+   * build_results: list of BuildResult from BuildExecutor.execute()
+   * plans_by_name: dict of target_name → BuildPlan
+   */
+  run(build_results, plans_by_name) {
+    log_header('Tests')
+
+    var results = []
+    for br in build_results {
+      if !br.success { continue }
+
+      var plan = plans_by_name.get(br.target_name, nil)
+      if !plan or plan.target_type != 'test' { continue }
+
+      var result = self._run_test(br, plan)
+      results.append(result)
+    }
+
+    self._print_summary(results)
+    return results
+  }
+
+  _run_test(build_result, plan) {
+    var result       = TestResult()
+    result.target_name = plan.target_name
+
+    log_step('test  ${plan.target_name}')
+
+    var artifact = build_result.artifact
+    var tc       = plan.test_config
+
+    # Build the command
+    var argv = []
+    if tc and tc.runner {
+      var runner = find_app_in_path(tc.runner)
+      if !runner {
+        log_warn('Test runner "${tc.runner}" not found; running artifact directly')
+        argv.append(artifact)
+      } else {
+        argv.append(runner)
+        argv.append(artifact)
+      }
+      if tc.runner_args { argv.extend(tc.runner_args) }
+    } else {
+      argv.append(artifact)
+    }
+
+    var cmd     = build_command(argv)
+    var timeout = (tc and tc.timeout) ? tc.timeout : 60
+
+    if self._verbose { log_cmd(cmd) }
+
+    var t_start = time()
+    var res     = os.exec(cmd)
+    var elapsed = (time() - t_start) * 1000
+
+    result.exit_code   = res.exit_code
+    result.output      = res.output
+    result.passed      = res.exit_code == 0
+    result.duration_ms = elapsed
+
+    if self._verbose or !result.passed {
+      echo res.output
+    }
+
+    if result.passed {
+      log_ok('PASS  ${plan.target_name}  (${elapsed}ms)')
+    } else {
+      log_error('FAIL  ${plan.target_name}  (exit code ${res.exit_code})')
+    }
+
+    return result
+  }
+
+  _print_summary(results) {
+    var passed = results.filter(@(r) { return r.passed }).length()
+    var failed = results.length() - passed
+    echo ''
+    echo '  Tests: ${passed} passed, ${failed} failed'
+    if failed > 0 {
+      raise Exception('kite: tests failed')
+    }
+  }
+}
+
+# ── Installer ─────────────────────────────────────────────────────────────────
+
+class Installer {
+
+  var _project_root  = ''
+  var _install_prefix = ''
+  var _verbose       = false
+
+  Installer(project_root, prefix, verbose) {
+    self._project_root   = project_root
+    self._install_prefix = prefix ? prefix : '/usr/local'
+    self._verbose        = verbose ? verbose : false
+  }
+
+  /**
+   * Install artifacts declared in each plan's InstallManifest.
+   * build_results: list of BuildResult (only successes processed)
+   * plans_by_name: dict of name → BuildPlan
+   */
+  install(build_results, plans_by_name, post_install_hooks) {
+    log_header('Install  →  ${self._install_prefix}')
+
+    var did_anything = false
+
+    for br in build_results {
+      if !br.success { continue }
+      var plan = plans_by_name.get(br.target_name, nil)
+      if !plan or !plan.install { continue }
+
+      did_anything = self._install_plan(br, plan) or did_anything
+    }
+
+    if !did_anything {
+      log_info('Nothing to install (add `install:` blocks to your targets)')
+    }
+
+    # Post-install hooks
+    if post_install_hooks and post_install_hooks.length() > 0 {
+      log_header('hook: post_install')
+      for cmd in post_install_hooks {
+        log_step(cmd)
+        var res = os.exec(cmd)
+        if res.exit_code != 0 {
+          log_error('Post-install hook failed: ${cmd} -> ${res.output}')
+        }
+      }
+    }
+  }
+
+  _install_plan(build_result, plan) {
+    var manifest    = plan.install
+    var did         = false
+
+    # Install the built artifact
+    if manifest.targets.contains(plan.target_name) {
+      var src  = build_result.artifact
+      var dest = os.join_paths(self._install_prefix, 'lib',
+                               os.base_name(src))
+      self._copy(src, dest)
+      did = true
+    }
+
+    # Install header tree
+    if manifest.headers {
+      var src_dir = os.join_paths(self._project_root, manifest.headers)
+      if os.dir_exists(src_dir) {
+        self._copy_tree(src_dir,
+                        os.join_paths(self._install_prefix, 'include'))
+        did = true
+      }
+    }
+
+    # Install individual files
+    for ifile in manifest.files {
+      var src  = os.join_paths(self._project_root, ifile.src)
+      var dest = os.join_paths(self._install_prefix, ifile.dest,
+                               os.base_name(ifile.src))
+      self._copy(src, dest)
+      did = true
+    }
+
+    return did
+  }
+
+  _copy(src, dest) {
+    mkdirp(os.dir_name(dest))
+    if self._verbose { log_step('install  ${src}  →  ${dest}') }
+    copy_file(src, dest)
+    log_ok('installed  ${os.base_name(dest)}  →  ${os.dir_name(dest)}')
+  }
+
+  _copy_tree(src_dir, dest_dir) {
+    var entries = os.read_dir(src_dir)
+    for entry in entries {
+      var src  = os.join_paths(src_dir, entry)
+      var dest = os.join_paths(dest_dir, entry)
+      if os.dir_exists(src) {
+        self._copy_tree(src, dest)
+      } else {
+        self._copy(src, dest)
+      }
+    }
+  }
+}
+
+# ── DepsInstaller ─────────────────────────────────────────────────────────────
+
+class DepsInstaller {
+
+  var _project_root = ''
+  var _dry_run      = false
+
+  DepsInstaller(project_root, dry_run) {
+    self._project_root = project_root
+    self._dry_run      = dry_run ? dry_run : false
+  }
+
+  /**
+   * Detect the host package manager and install declared package_dependencies
+   * for all plans.
+   */
+  install(plans) {
+    log_header('Dependencies')
+
+    var manager = self._detect_manager()
+    if !manager {
+      log_warn('No supported package manager found; skipping deps install')
+      log_info('Supported: apt, yum, dnf, brew, pacman, winget')
+      return
+    }
+
+    log_info('Package manager: ${manager}')
+
+    # Collect all unique packages for this manager across all plans
+    var all_pkgs = {}
+    for plan in plans {
+      if !plan.package_deps { continue }
+      var pkgs = plan.package_deps.for_manager(manager)
+      for pkg in pkgs { all_pkgs[pkg] = true }
+    }
+
+    if all_pkgs.length() == 0 {
+      log_info('No packages to install for ${manager}')
+      return
+    }
+
+    var pkg_list = all_pkgs.keys()
+    pkg_list.sort()
+    log_step('Installing: ${", ".join(pkg_list)}')
+
+    var cmd = self._install_command(manager, pkg_list)
+    log_cmd(cmd)
+
+    if !self._dry_run {
+      var res = os.exec(cmd)
+      if res.exit_code != 0 {
+        log_error('Package install failed')
+        echo res.output
+        raise Exception('kite deps: package installation failed')
+      }
+      log_ok('Packages installed')
+    }
+  }
+
+  _detect_manager() {
+    if is_windows {
+      if find_app_in_path('winget') { return 'winget' }
+      if find_app_in_path('choco')  { return 'choco'  }
+      return nil
+    }
+    if is_macos {
+      if find_app_in_path('brew') { return 'brew' }
+      return nil
+    }
+    # Linux
+    if find_app_in_path('apt-get') { return 'apt'    }
+    if find_app_in_path('apt')     { return 'apt'    }
+    if find_app_in_path('dnf')     { return 'dnf'    }
+    if find_app_in_path('yum')     { return 'yum'    }
+    if find_app_in_path('pacman')  { return 'pacman' }
+    if find_app_in_path('zypper')  { return 'zypper' }
+    return nil
+  }
+
+  _install_command(manager, packages) {
+    var pkgs = ' '.join(packages)
+    if manager == 'apt' {
+      return 'sudo apt-get install -y ${pkgs}'
+    }
+    if manager == 'yum' { return 'sudo yum install -y ${pkgs}' }
+    if manager == 'dnf' { return 'sudo dnf install -y ${pkgs}' }
+    if manager == 'brew' { return 'brew install ${pkgs}' }
+    if manager == 'pacman' { return 'sudo pacman -S --noconfirm ${pkgs}' }
+    if manager == 'zypper' { return 'sudo zypper install -y ${pkgs}' }
+    if manager == 'winget' {
+      # winget doesn't support bulk installs easily; chain them
+      return ' && '.join(packages.map(@(p) => 'winget install ${p}'))
+    }
+    if manager == 'choco' { return 'choco install -y ${pkgs}' }
+    return 'echo "Unknown manager: ${manager}"'
+  }
+}
+
+# ── Cleaner ───────────────────────────────────────────────────────────────────
+
+class Cleaner {
+
+  var _project_root = ''
+  var _build_dir    = ''
+
+  Cleaner(project_root) {
+    self._project_root = project_root
+    self._build_dir    = os.join_paths(project_root, '.kite', 'build')
+  }
+
+  /**
+   * Remove all compiled objects and linked artifacts.
+   * Keeps the source tree and cache file unless `full` is true.
+   */
+  clean(plans, full) {
+    log_header('Clean')
+
+    # Remove artifact outputs
+    for plan in plans {
+      if file(plan.output_path).exists() {
+        log_step('remove ${plan.output_path}')
+        catch { os.remove(plan.output_path) }
+      }
+    }
+
+    # Remove obj directory
+    var obj_dir = os.join_paths(self._build_dir, 'obj')
+    if os.dir_exists(obj_dir) {
+      log_step('remove ${obj_dir}')
+      self._rm_tree(obj_dir)
+    }
+
+    if full {
+      # Remove entire .kite/build directory including cache
+      if os.dir_exists(self._build_dir) {
+        log_step('remove ${self._build_dir}')
+        self._rm_tree(self._build_dir)
+      }
+    }
+
+    log_ok('Clean complete')
+  }
+
+  _rm_tree(dir) {
+    var entries = []
+    catch { 
+      entries = os.read_dir(dir) 
+    } as e 
+    if e { 
+      return 
+    }
+
+    for entry in entries {
+      var full = os.join_paths(dir, entry)
+      if os.dir_exists(full) {
+        self._rm_tree(full)
+      } else {
+        catch { os.remove(full) }
+      }
+    }
+    catch { os.remove_dir(dir) }
+  }
+}

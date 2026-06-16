@@ -1,0 +1,28 @@
+/**
+ * index.zu  —  Public surface of the kite build system.
+ *
+ * The build system is split across:
+ *
+ *   intent/         ← declaration model (Project, Target, PlatformContext, …)
+ *   utils.zu        ← path resolution, glob, filesystem, terminal
+ *   toolchain.zu    ← compiler/linker command assembly
+ *   cache.zu        ← incremental build cache
+ *   generator.zu    ← pre-build code generation steps
+ *   executor.zu     ← compile + link loop
+ *   actions.zu      ← test runner, installer, deps, cleaner
+ *   kite.zu         ← CLI entry point  (run with: zuri kite.zu)
+ */
+
+import .utils     { detect_arch, find_app_in_path, find_app_in_system_path,
+                    expand_globs, mkdirp, copy_file, needs_rebuild,
+                    shell_quote, build_command,
+                    log_info, log_ok, log_warn, log_error,
+                    log_step, log_header, log_cmd,
+                    is_windows, is_macos, is_linux, is_unix }
+
+import .toolchain { Toolchain, CompileCommand, LinkCommand }
+import .cache     { BuildCache }
+import .generator { GeneratorRunner }
+import .executor  { BuildExecutor, BuildResult }
+import .actions   { TestRunner, TestResult,
+                    Installer, DepsInstaller, Cleaner }

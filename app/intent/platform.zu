@@ -1,0 +1,288 @@
+/**
+ * kite/intent/platform.zu
+ *
+ * Platform predicate model and boolean expression evaluator for
+ * conditional config keys like "linux && x86_64" or "gcc && !windows".
+ *
+ * Supported predicates (fixed set — no arbitrary scripting):
+ *   OS        : linux | macos | windows | unix | bsd
+ *   Arch      : x86_64 | arm64 | arm | x86 | wasm
+ *   Compiler  : gcc | clang | msvc | cc
+ *   Profile   : debug | release | asan | coverage (+ any user-defined name)
+ *   Wildcard  : * (always true)
+ */
+
+import os
+import ..utils { detect_arch, find_compiler }
+
+# ── Known predicate sets ────────────────────────────────────────────────────
+
+var OS_NAMES       = ['linux', 'macos', 'windows', 'unix', 'bsd']
+var ARCH_NAMES     = ['x86_64', 'arm64', 'arm', 'x86', 'wasm']
+var COMPILER_NAMES = ['gcc', 'clang', 'msvc', 'cc']
+
+# ── PlatformContext ──────────────────────────────────────────────────────────
+
+/**
+ * Captures the current build environment.
+ * Constructed once per build invocation and passed into every resolver.
+ */
+class PlatformContext {
+
+  var os       = ''    # 'linux' | 'macos' | 'windows'
+  var arch     = ''    # 'x86_64' | 'arm64' | ...
+  var compiler = ''    # 'gcc' | 'clang' | 'msvc' | 'cc'
+  var profile  = ''    # 'debug' | 'release' | ...
+
+  PlatformContext(os, arch, compiler, profile) {
+    self.os       = os
+    self.arch     = arch
+    self.compiler = compiler
+    self.profile  = profile
+  }
+
+  /**
+   * Evaluate whether a single predicate token matches this context.
+   * Token may be a bare name ("linux", "x86_64") or "*".
+   */
+  _match_token(token) {
+    token = token.trim()
+    if token == '*' { return true }
+
+    # unix is a meta-predicate: linux | macos | bsd
+    if token == 'unix' {
+      return self.os == 'linux' or self.os == 'macos' or self.os == 'bsd'
+    }
+
+    return token == self.os       or
+           token == self.arch     or
+           token == self.compiler or
+           token == self.profile
+  }
+
+  /**
+   * Evaluate a boolean expression key.
+   *
+   * Grammar (recursive descent, operator precedence low→high):
+   *   expr   := or_expr
+   *   or_expr  := and_expr  ('||' and_expr)*
+   *   and_expr := not_expr  ('&&' not_expr)*
+   *   not_expr := '!' not_expr | atom
+   *   atom     := token | '(' expr ')'
+   *
+   * Returns true if the expression matches this context.
+   */
+  matches(expr) {
+    expr = expr.trim()
+    if expr == '*' or expr == '' { return true }
+
+    var tokens = self._tokenize(expr)
+    var pos    = [0]   # boxed so recursive helpers can mutate it
+    return self._parse_or(tokens, pos)
+  }
+
+  # ── tokenizer ─────────────────────────────────────────────────────────
+
+  _tokenize(expr) {
+    var tokens = []
+    var i = 0
+    var chars = expr.split('')
+
+    while i < chars.length() {
+      var ch = chars[i]
+
+      if ch == ' ' or ch == '\t' {
+        i++
+        continue
+      }
+
+      if ch == '(' or ch == ')' {
+        tokens.append(ch)
+        i++
+        continue
+      }
+
+      if ch == '!' {
+        tokens.append('!')
+        i++
+        continue
+      }
+
+      if ch == '&' and i + 1 < chars.length() and chars[i+1] == '&' {
+        tokens.append('&&')
+        i += 2
+        continue
+      }
+
+      if ch == '|' and i + 1 < chars.length() and chars[i+1] == '|' {
+        tokens.append('||')
+        i += 2
+        continue
+      }
+
+      # identifier
+      var word = ''
+      while i < chars.length() {
+        var c = chars[i]
+        if c == ' ' or c == '\t' or c == '(' or c == ')' or
+           c == '!' or c == '&' or c == '|' {
+          break
+        }
+        word += c
+        i++
+      }
+      if word != '' { tokens.append(word) }
+    }
+
+    return tokens
+  }
+
+  # ── recursive descent parser ──────────────────────────────────────────
+
+  _parse_or(tokens, pos) {
+    var left = self._parse_and(tokens, pos)
+    while pos[0] < tokens.length() and tokens[pos[0]] == '||' {
+      pos[0]++
+      var right = self._parse_and(tokens, pos)
+      left = left or right
+    }
+    return left
+  }
+
+  _parse_and(tokens, pos) {
+    var left = self._parse_not(tokens, pos)
+    while pos[0] < tokens.length() and tokens[pos[0]] == '&&' {
+      pos[0]++
+      var right = self._parse_not(tokens, pos)
+      left = left and right
+    }
+    return left
+  }
+
+  _parse_not(tokens, pos) {
+    if pos[0] < tokens.length() and tokens[pos[0]] == '!' {
+      pos[0]++
+      return !self._parse_not(tokens, pos)
+    }
+    return self._parse_atom(tokens, pos)
+  }
+
+  _parse_atom(tokens, pos) {
+    if pos[0] >= tokens.length() { return false }
+
+    var tok = tokens[pos[0]]
+
+    if tok == '(' {
+      pos[0]++
+      var result = self._parse_or(tokens, pos)
+      if pos[0] < tokens.length() and tokens[pos[0]] == ')' {
+        pos[0]++
+      }
+      return result
+    }
+
+    pos[0]++
+    return self._match_token(tok)
+  }
+
+  # ── convenience factory ───────────────────────────────────────────────
+
+  static detect() {
+    var arch     = detect_arch()
+    var compiler = find_compiler()
+    var profile  = os.get_env('KITE_PROFILE', 'debug')
+    return PlatformContext(os.platform, arch, compiler, profile)
+  }
+}
+
+# ── PlatformMap ─────────────────────────────────────────────────────────────
+
+/**
+ * A dict-like container whose keys are platform expressions.
+ * resolve(ctx) returns a flat list of all values whose key matches ctx,
+ * evaluated in declaration order (specificity wins via ordering convention).
+ *
+ * Example YAML source that produces a PlatformMap:
+ *
+ *   compile_options:
+ *     "*":             [-Wall]
+ *     "linux":         [-O2, -fstack-protector-strong]
+ *     "linux && arm64": [-march=armv8-a+crypto]
+ *     windows:         [/W3]
+ *
+ * All matching entries are merged (not overridden), so "*" + "linux" both
+ * contribute when building on Linux.
+ */
+class PlatformMap {
+
+  var _entries = []   # list of {expr, value} dicts; preserves insertion order
+
+  PlatformMap() {}
+
+  /**
+   * Add a (platform_expression → value) pair.
+   * value may be any Zuri value: list, string, dict, etc.
+   */
+  set(expr, value) {
+    self._entries.append({ 'expr': expr, 'value': value })
+    return self
+  }
+
+  /**
+   * Return all values whose platform expression matches ctx.
+   * For list values the results are flattened into one list.
+   * For non-list values a list of matching values is returned.
+   */
+  resolve(ctx) {
+    var result = []
+    for entry in self._entries {
+      if ctx.matches(entry['expr']) {
+        var v = entry['value']
+        if is_list(v) {
+          result.extend(v)
+        } else {
+          result.append(v)
+        }
+      }
+    }
+    return result
+  }
+
+  /**
+   * Like resolve() but returns the *last* matching scalar value,
+   * useful for single-valued fields like `compiler` or `linker`.
+   */
+  resolve_one(ctx) {
+    var last = nil
+    for entry in self._entries {
+      if ctx.matches(entry['expr']) {
+        last = entry['value']
+      }
+    }
+    return last
+  }
+
+  /**
+   * Build a PlatformMap from a raw dict (as parsed from YAML).
+   * If given a plain list it is stored under "*".
+   */
+  static from_raw(raw) {
+    var pm = PlatformMap()
+    if is_list(raw) {
+      pm.set('*', raw)
+    } else if is_dict(raw) {
+      for key, value in raw {
+        pm.set(key, value)
+      }
+    }
+    return pm
+  }
+
+  to_dict() {
+    var out = {}
+    for entry in self._entries {
+      out[entry['expr']] = entry['value']
+    }
+    return out
+  }
+}

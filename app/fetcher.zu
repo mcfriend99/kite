@@ -1,0 +1,193 @@
+/**
+ * kite/fetcher.zu
+ *
+ * Fetcher — resolves and executes pre_fetch steps before the build.
+ *
+ * Supported types:
+ *   git      — requires git in PATH; clones or pulls into target dir
+ *   zip      — downloads and extracts via Zuri's zip module
+ *   tar.gz   — downloads and extracts via Zuri's tar module
+ *   tgz      — alias for tar.gz
+ *   tar      — uncompressed tar
+ *   gz       — alias for tar.gz
+ *
+ * If `target` is omitted the archive is extracted into the project root.
+ * If `target` already exists and is non-empty the step is skipped
+ * (for git: a pull is attempted instead of a fresh clone).
+ */
+
+import os
+import http
+import zip
+import tar
+import .utils {
+  find_app_in_path, mkdirp,
+  log_info, log_ok, log_warn, log_error, log_step, log_cmd,
+  is_windows, build_command
+}
+import .intent { FetchStep }
+
+class Fetcher {
+
+  var _project_root = ''
+  var _verbose      = false
+
+  Fetcher(project_root, verbose) {
+    self._project_root = project_root
+    self._verbose      = verbose ? verbose : false
+  }
+
+  /**
+   * Resolve and run all pre_fetch steps for the current platform context.
+   * hooks.pre_fetch is a PlatformMap whose resolved value is a list of
+   * raw dicts; we convert each to a FetchStep and execute it.
+   */
+  run(hooks, ctx) {
+    if !hooks or !hooks.pre_fetch { 
+      return 
+    }
+
+    var raw_steps = hooks.pre_fetch.resolve(ctx)
+    if raw_steps.length() == 0 { 
+      return 
+    }
+
+    var steps = raw_steps.map(@(r) => FetchStep.from_raw(r))
+
+    log_step('pre_fetch  (${steps.length()} step(s))')
+
+    for step in steps {
+      self._run_step(step)
+    }
+  }
+
+  _run_step(step) {
+    if step.url == '' {
+      log_warn('pre_fetch: skipping entry with no url')
+      return
+    }
+    if step.type == '' {
+      log_warn('pre_fetch: skipping "${step.url}" — no type specified')
+      return
+    }
+
+    var dest = step.target ?
+      os.join_paths(self._project_root, step.target) :
+      self._project_root
+
+    var t = step.type.lower()
+
+    if t == 'git' {
+      self._fetch_git(step.url, dest)
+    } else if ['tar.gz', 'tgz', 'gz', 'tar'].contains(t) {
+      self._fetch_archive(step.url, dest, 'tar')
+    } else if t == 'zip' {
+      self._fetch_archive(step.url, dest, 'zip')
+    } else {
+      log_warn('pre_fetch: unknown type "${step.type}" for ${step.url}')
+    }
+  }
+
+  # ── Git ────────────────────────────────────────────────────────────────
+
+  _fetch_git(url, dest) {
+    var git = find_app_in_path('git')
+    if !git {
+      log_error('pre_fetch: git is required for type=git but was not found in PATH')
+      die('kite: git not found')
+    }
+
+    mkdirp(dest)
+
+    # If dest already contains a .git dir, pull instead of clone
+    var git_dir = os.join_paths(dest, '.git')
+    if os.dir_exists(git_dir) {
+      log_step('git pull  ${url}  →  ${dest}')
+      var cmd = build_command([git, '-C', dest, 'pull', '--ff-only'])
+      if self._verbose { log_cmd(cmd) }
+      var res = os.exec(cmd)
+      if res.exit_code != 0 {
+        log_warn('git pull failed (continuing with existing checkout):')
+        log_warn(res.output)
+      } else {
+        log_ok('git pull  ${dest}')
+      }
+      return
+    }
+
+    # Fresh clone
+    log_step('git clone  ${url}  →  ${dest}')
+    var cmd = build_command([git, 'clone', '--depth=1', url, dest])
+    if self._verbose { log_cmd(cmd) }
+    var res = os.exec(cmd)
+    if res.exit_code != 0 {
+      log_error('git clone failed:')
+      log_error(res.output)
+      die('kite: git clone failed for ${url}')
+    }
+    log_ok('git clone  ${dest}')
+  }
+
+  # ── Archive (tar / zip) ────────────────────────────────────────────────
+
+  _fetch_archive(url, dest, kind) {
+    # Skip if destination already exists and is non-empty
+    if os.dir_exists(dest) and self._dir_non_empty(dest) {
+      log_info('pre_fetch: ${dest} already exists — skipping download')
+      return
+    }
+
+    mkdirp(dest)
+
+    # Download to a temp file
+    var ext      = kind == 'zip' ? '.zip' : '.tar.gz'
+    var tmp_path = os.join_paths(self._project_root, '.kite',
+                                 'fetch_' + self._url_slug(url) + ext)
+
+    mkdirp(os.dir_name(tmp_path))
+
+    log_step('download  ${url}')
+    self._download(url, tmp_path)
+
+    # Extract
+    log_step('extract   ${tmp_path}  →  ${dest}')
+    if kind == 'zip' {
+      zip.extract(tmp_path, dest)
+    } else {
+      tar.extract(tmp_path, dest)
+    }
+
+    # Remove temp file
+    catch { os.remove(tmp_path) }
+
+    log_ok('fetched  ${dest}')
+  }
+
+  _download(url, dest_path) {
+    var res = http.get(url)
+    if !res.is_ok() {
+      log_error('Download failed: ${url}  (HTTP ${res.status_code})')
+      die('kite: pre_fetch download failed for ${url}')
+    }
+    file(dest_path, 'wb').write(res.body)
+  }
+
+  _dir_non_empty(path) {
+    catch {
+      var entries = os.read_dir(path)
+      return entries.length() > 0
+    }
+    return false
+  }
+
+  # Produce a safe filename slug from a URL
+  _url_slug(url) {
+    return url
+      .replace('https://', '')
+      .replace('http://', '')
+      .replace('/', '_')
+      .replace(':', '_')
+      .replace('.', '_')
+      [0, 64]
+  }
+}
