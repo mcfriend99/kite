@@ -342,7 +342,7 @@ def main() {
 
   if error {
     echo error.message
-    echo error.stacktrace
+    # echo error.stacktrace
     os.exit(1)
   }
 }
